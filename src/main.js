@@ -37,6 +37,15 @@ scene.add(world);
 
 const tmpVec = new THREE.Vector3();
 const scaleObjects = new Map();
+const ALWAYS_ON_LAYERS = new Set([
+  "Earth",
+  "Near Space",
+  "Solar System",
+  "Kuiper Belt",
+  "Oort Cloud",
+  "Milky Way",
+  "Cosmic Web",
+]);
 const metersPerWorldUnit = 1;
 const EARTH_RADIUS = 6700;
 const LAND_REGIONS = [
@@ -45,6 +54,10 @@ const LAND_REGIONS = [
   { x: -500, z: 1800, r: 1500 },
   { x: 2200, z: 1500, r: 1200 },
   { x: -2600, z: 1500, r: 1100 },
+  { x: 3200, z: -900, r: 1000 },
+  { x: -3300, z: -1400, r: 900 },
+  { x: 2700, z: 2700, r: 850 },
+  { x: -800, z: -3100, r: 950 },
 ];
 const minExponent = -1.7;
 const maxExponent = 23;
@@ -233,7 +246,6 @@ function addNeighborhoodCluster(group, centerX, centerZ, options = {}) {
 
 function createPicnicScale() {
   const group = new THREE.Group();
-  group.add(makeGround(9, 0x496c3e, 0.0));
 
   const blanket = new THREE.Mesh(
     new THREE.BoxGeometry(2.2, 0.06, 1.4),
@@ -277,7 +289,6 @@ function createPicnicScale() {
 
 function createParkScale() {
   const group = new THREE.Group();
-  group.add(makeGround(2400, 0x3f6a37, -0.06));
 
   // Keep the center open for the picnic and reveal trees around it.
   for (let i = 0; i < 90; i += 1) {
@@ -371,65 +382,14 @@ function createEarthScale() {
   const earthRadius = EARTH_RADIUS;
   const earthGeometry = new THREE.CircleGeometry(earthRadius, 96);
   const earthMaterial = new THREE.MeshStandardMaterial({
-    color: 0x2b67ba,
-    roughness: 0.55,
-    metalness: 0.08,
+    color: 0x3f8f3f,
+    roughness: 0.9,
+    metalness: 0.0,
   });
   const earth = new THREE.Mesh(earthGeometry, earthMaterial);
   earth.rotation.x = -Math.PI / 2;
   earth.position.y = -0.14;
   group.add(earth);
-
-  const landMaterial = new THREE.MeshStandardMaterial({
-    color: 0x4c9142,
-    roughness: 0.95,
-  });
-
-  // Reduced and cleaner land layering to avoid z-fighting/glitch artifacts.
-  for (const center of LAND_REGIONS) {
-    for (let i = 0; i < 7; i += 1) {
-      const angle = Math.random() * Math.PI * 2;
-      const radiusOffset = Math.random() * center.r * 0.72;
-      const px = center.x + Math.cos(angle) * radiusOffset;
-      const pz = center.z + Math.sin(angle) * radiusOffset;
-      const blob = new THREE.Mesh(
-        new THREE.CircleGeometry(260 + Math.random() * 440, 26),
-        landMaterial,
-      );
-      blob.rotation.x = -Math.PI / 2;
-      blob.scale.set(0.65 + Math.random() * 0.95, 1, 0.65 + Math.random() * 0.95);
-      blob.rotation.z = Math.random() * Math.PI * 2;
-      blob.position.set(px, -0.11, pz);
-      group.add(blob);
-    }
-  }
-
-  const forestMaterial = new THREE.MeshStandardMaterial({ color: 0x315d2b, roughness: 1 });
-  for (let i = 0; i < 170; i += 1) {
-    const { x, z } = randomPointInRing(140, earthRadius - 160);
-    if (!isLandAt(x, z)) {
-      continue;
-    }
-    const dot = new THREE.Mesh(new THREE.CircleGeometry(22 + Math.random() * 26, 10), forestMaterial);
-    dot.rotation.x = -Math.PI / 2;
-    dot.position.set(x, -0.09, z);
-    group.add(dot);
-  }
-
-  const hillMaterial = new THREE.MeshStandardMaterial({ color: 0x3b7b33, roughness: 1.0 });
-  for (let i = 0; i < 55; i += 1) {
-    const { x, z } = randomPointInRing(300, earthRadius - 300);
-    if (!isLandAt(x, z)) {
-      continue;
-    }
-    const hill = new THREE.Mesh(
-      new THREE.ConeGeometry(36 + Math.random() * 70, 16 + Math.random() * 34, 10),
-      hillMaterial,
-    );
-    hill.position.set(x, hill.geometry.parameters.height / 2 - 0.105, z);
-    hill.rotation.y = Math.random() * Math.PI * 2;
-    group.add(hill);
-  }
 
   return group;
 }
@@ -438,69 +398,70 @@ function createPlanetaryScale() {
   const group = new THREE.Group();
   const kmToWorld = EARTH_RADIUS / 6_371;
   const anchorZ = 0;
-
-  // Planar starfield on Earth's plane so stars enter earlier during zoom-out.
-  const planarStars = new THREE.BufferGeometry();
-  const starCount = 9000;
-  const positions = new Float32Array(starCount * 3);
-  for (let i = 0; i < starCount; i += 1) {
-    const angle = Math.random() * Math.PI * 2;
-    const radius = 14_000 + Math.random() * 420_000;
-    const idx = i * 3;
-    positions[idx] = Math.cos(angle) * radius;
-    positions[idx + 1] = 0;
-    positions[idx + 2] = anchorZ + Math.sin(angle) * radius;
-  }
-  planarStars.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  group.add(
-    new THREE.Points(
-      planarStars,
-      new THREE.PointsMaterial({
-        color: 0xf4f7ff,
-        size: 18,
-        sizeAttenuation: true,
-        transparent: true,
-        opacity: 0.85,
-      }),
-    ),
-  );
+  const sunCenter = new THREE.Vector2(-780_000, anchorZ - 80_000);
 
   const innerPlanets = [
-    { radiusKm: 2_440, color: 0xff2e2e, x: -38_000, z: anchorZ - 1_500 }, // Mercury red
-    { radiusKm: 6_052, color: 0xff8e1a, x: -24_000, z: anchorZ + 900 },   // Venus orange
-    { radiusKm: 3_390, color: 0xffdb3a, x: 24_000, z: anchorZ - 1_100 },  // Mars yellow
+    // Keep each planet at same orbit radius, but move to new angles.
+    { radiusKm: 2_440, color: 0xff2e2e, x: -38_000, z: anchorZ - 1_500, orbitAngle: 2.55 }, // Mercury red
+    { radiusKm: 6_052, color: 0xff8e1a, x: -24_000, z: anchorZ + 900, orbitAngle: 2.0 },    // Venus orange
+    { radiusKm: 3_390, color: 0xffdb3a, x: 24_000, z: anchorZ - 1_100, orbitAngle: 0.65 },   // Mars yellow
   ];
   for (const planet of innerPlanets) {
+    const radiusFromSun = Math.hypot(planet.x - sunCenter.x, planet.z - sunCenter.y);
+    const x = sunCenter.x + Math.cos(planet.orbitAngle) * radiusFromSun;
+    const z = sunCenter.y + Math.sin(planet.orbitAngle) * radiusFromSun;
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(planet.radiusKm * kmToWorld, 26, 16),
       new THREE.MeshBasicMaterial({ color: planet.color }),
     );
-    mesh.position.set(planet.x, 0, planet.z);
+    mesh.position.set(x, 0, z);
     group.add(mesh);
   }
 
   // Outer planets are present in the same scene from the start, farther right.
   const outerPlanets = [
-    { radiusKm: 69_911, color: 0x31c94e, x: 170_000, z: anchorZ + 8_000 }, // Jupiter green
-    { radiusKm: 58_232, color: 0x3d72ff, x: 345_000, z: anchorZ - 6_000 }, // Saturn blue
-    { radiusKm: 25_362, color: 0x8e44ff, x: 470_000, z: anchorZ + 5_000 }, // Uranus purple
-    { radiusKm: 24_622, color: 0xff5fb5, x: 600_000, z: anchorZ - 7_000 }, // Neptune pink
+    { radiusKm: 69_911, color: 0x31c94e, x: 140_000, z: anchorZ + 6_000, orbitAngle: 1.1 },  // Jupiter green
+    { radiusKm: 58_232, color: 0x3d72ff, x: 400_000, z: anchorZ - 6_000, orbitAngle: 0.38 }, // Saturn blue
+    { radiusKm: 25_362, color: 0x8e44ff, x: 620_000, z: anchorZ + 5_000, orbitAngle: -0.55 }, // Uranus purple
+    { radiusKm: 24_622, color: 0xff5fb5, x: 730_000, z: anchorZ - 7_000, orbitAngle: -1.12 }, // Neptune pink
   ];
   for (const planet of outerPlanets) {
+    const radiusFromSun = Math.hypot(planet.x - sunCenter.x, planet.z - sunCenter.y);
+    const x = sunCenter.x + Math.cos(planet.orbitAngle) * radiusFromSun;
+    const z = sunCenter.y + Math.sin(planet.orbitAngle) * radiusFromSun;
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(planet.radiusKm * kmToWorld, 28, 18),
       new THREE.MeshBasicMaterial({ color: planet.color }),
     );
-    mesh.position.set(planet.x, 0, planet.z);
+    mesh.position.set(x, 0, z);
     group.add(mesh);
+
+    // Add ring to Saturn for visual identity.
+    if (planet.radiusKm === 58_232) {
+      const ring = new THREE.Mesh(
+        new THREE.RingGeometry(planet.radiusKm * kmToWorld * 1.25, planet.radiusKm * kmToWorld * 1.9, 64),
+        new THREE.MeshBasicMaterial({
+          color: 0xd8d2bf,
+          side: THREE.DoubleSide,
+          transparent: true,
+          opacity: 0.8,
+        }),
+      );
+      // Start flat to camera, then tilt with left side dipping toward Jupiter.
+      ring.rotation.set(-Math.PI / 2 + 0.26, 0.0, 0.36);
+      ring.position.copy(mesh.position);
+      group.add(ring);
+    }
   }
 
   // Sun stays left and off center so it does not block Earth.
   const sun = new THREE.Mesh(
-    new THREE.SphereGeometry(696_700 * kmToWorld, 30, 20),
+    new THREE.CircleGeometry(696_700 * kmToWorld, 64),
     new THREE.MeshBasicMaterial({ color: 0xffc06b }),
   );
-  sun.position.set(-900_000, -700_000, anchorZ);
+  // Flat disk reads cleaner in top-down composition.
+  sun.rotation.x = -Math.PI / 2;
+  sun.position.set(-780_000, 0, anchorZ - 80_000);
   group.add(sun);
 
   return group;
@@ -508,13 +469,77 @@ function createPlanetaryScale() {
 
 function createSolarScale() {
   const group = new THREE.Group();
-  group.add(addStarField(1_400_000, 20000, 0xdde4ff, 65));
 
+  return group;
+}
+
+function createKuiperBeltScale() {
+  const group = new THREE.Group();
+  // Match the Sun center in x/z so the belt is truly sun-centered.
+  const center = new THREE.Vector3(-780_000, -1_200_000, 0);
+  const count = 14000;
+  const positions = new Float32Array(count * 3);
+  for (let i = 0; i < count; i += 1) {
+    const angle = Math.random() * Math.PI * 2;
+    const radius = 2_100_000 + Math.random() * 1_400_000;
+    const idx = i * 3;
+    positions[idx] = center.x + Math.cos(angle) * radius;
+    positions[idx + 1] = center.y + (Math.random() - 0.5) * 40_000;
+    positions[idx + 2] = center.z + Math.sin(angle) * radius;
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  group.add(
+    new THREE.Points(
+      geom,
+      new THREE.PointsMaterial({
+        color: 0xbec8d9,
+        size: 34,
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0.88,
+      }),
+    ),
+  );
+  return group;
+}
+
+function createOortCloudScale() {
+  const group = new THREE.Group();
+  const center = new THREE.Vector3(-780_000, -5_200_000, 0);
+  const count = 24000;
+  const positions = new Float32Array(count * 3);
+  for (let i = 0; i < count; i += 1) {
+    const u = Math.random();
+    const v = Math.random();
+    const theta = 2 * Math.PI * u;
+    const phi = Math.acos(2 * v - 1);
+    const radius = 5_400_000 + Math.random() * 4_600_000;
+    const idx = i * 3;
+    positions[idx] = center.x + radius * Math.sin(phi) * Math.cos(theta);
+    positions[idx + 1] = center.y + radius * Math.cos(phi);
+    positions[idx + 2] = center.z + radius * Math.sin(phi) * Math.sin(theta);
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  group.add(
+    new THREE.Points(
+      geom,
+      new THREE.PointsMaterial({
+        color: 0xe2e8f5,
+        size: 44,
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0.58,
+      }),
+    ),
+  );
   return group;
 }
 
 function createGalacticScale() {
   const group = new THREE.Group();
+  const galacticCenter = new THREE.Vector3(3_800_000, -120_000_000, -3_200_000);
   const armCount = 5;
   const starsPerArm = 2200;
   const positions = new Float32Array(armCount * starsPerArm * 3);
@@ -524,11 +549,11 @@ function createGalacticScale() {
     const armOffset = (arm / armCount) * Math.PI * 2;
     for (let i = 0; i < starsPerArm; i += 1) {
       const t = i / starsPerArm;
-      const radius = 2000 + t * 8500 + (Math.random() - 0.5) * 280;
+      const radius = 5_000_000 + t * 20_000_000 + (Math.random() - 0.5) * 600_000;
       const angle = armOffset + t * 8.0 + (Math.random() - 0.5) * 0.25;
-      positions[cursor] = Math.cos(angle) * radius;
-      positions[cursor + 1] = (Math.random() - 0.5) * 700;
-      positions[cursor + 2] = Math.sin(angle) * radius;
+      positions[cursor] = galacticCenter.x + Math.cos(angle) * radius;
+      positions[cursor + 1] = galacticCenter.y + (Math.random() - 0.5) * 800_000;
+      positions[cursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
       cursor += 3;
     }
   }
@@ -540,7 +565,7 @@ function createGalacticScale() {
       geom,
       new THREE.PointsMaterial({
         color: 0xc9d4ff,
-        size: 6,
+        size: 11000,
         sizeAttenuation: true,
         transparent: true,
         opacity: 0.85,
@@ -552,25 +577,7 @@ function createGalacticScale() {
 
 function createCosmicScale() {
   const group = new THREE.Group();
-  group.add(addStarField(32_000, 20_000, 0xeff3ff, 7.4));
-
-  for (let i = 0; i < 8; i += 1) {
-    const cluster = new THREE.Mesh(
-      new THREE.IcosahedronGeometry(220 + Math.random() * 120, 1),
-      new THREE.MeshBasicMaterial({
-        color: new THREE.Color().setHSL(0.62 + Math.random() * 0.15, 0.55, 0.66),
-        transparent: true,
-        opacity: 0.23,
-        wireframe: true,
-      }),
-    );
-    cluster.position.set(
-      (Math.random() - 0.5) * 28_000,
-      (Math.random() - 0.5) * 18_000,
-      (Math.random() - 0.5) * 28_000,
-    );
-    group.add(cluster);
-  }
+  const cosmicCenter = new THREE.Vector3(-780_000, -60_000_000, -80_000);
 
   return group;
 }
@@ -608,9 +615,12 @@ const scaleDefinitions = [
   { name: "Park and Trees", min: 0.25, max: 2.2, blend: 0.52, factory: createParkScale },
   { name: "Neighborhood", min: 1.5, max: 4.1, blend: 0.52, factory: createNeighborhoodScale },
   { name: "Cityscape", min: 3.2, max: 5.9, blend: 0.56, factory: createCityScale },
-  { name: "Earth", min: 2.8, max: 8, blend: 1.0, factory: createEarthScale },
-  { name: "Near Space", min: 4.4, max: 10.5, blend: 0.95, factory: createPlanetaryScale },
+  // Earth is the permanent base layer in the stack.
+  { name: "Earth", min: -2, max: 24, blend: 0.2, factory: createEarthScale },
+  { name: "Near Space", min: 5.8, max: 10.5, blend: 0.8, factory: createPlanetaryScale },
   { name: "Solar System", min: 8.6, max: 14, blend: 0.6, factory: createSolarScale },
+  { name: "Kuiper Belt", min: 10.5, max: 16, blend: 0.6, factory: createKuiperBeltScale },
+  { name: "Oort Cloud", min: 12, max: 18, blend: 0.6, factory: createOortCloudScale },
   { name: "Milky Way", min: 14, max: 19, blend: 0.6, factory: createGalacticScale },
   { name: "Cosmic Web", min: 19, max: 24, blend: 0.6, factory: createCosmicScale },
 ];
@@ -631,7 +641,9 @@ function updateRanges() {
     if (!object) {
       continue;
     }
-    const alpha = smoothStep(def.min - def.blend, def.min + def.blend, exponent);
+    const alpha = ALWAYS_ON_LAYERS.has(def.name)
+      ? 1
+      : smoothStep(def.min - def.blend, def.min + def.blend, exponent);
     setObjectOpacity(object, alpha);
   }
 }

@@ -165,3 +165,50 @@ Earth visual strategy currently:
   - coplanar meshes causing z-fighting,
   - too many transparent overlapping materials,
   - objects placed outside intended land/earth bounds.
+
+## Progress Log - 2026-04-30
+
+This section captures the major changes made today so work can resume cleanly.
+
+### Earth / Surface Stack
+
+- Confirmed design intent: one giant scene with Earth as bottom-most layer.
+- Removed extra Earth-side ground disks that created inner circle artifacts (`createParkScale`, `createPicnicScale`).
+- Made Earth base layer always present in stack (`scaleDefinitions` + always-on behavior).
+- Simplified Earth rendering to a single green Earth mesh temporarily to avoid getting blocked on texture artifacts.
+- Kept non-Earth content as additional meshes above Earth (picnic, trees, neighborhoods, cities, planets, etc.).
+
+### Planet / Sun Layout
+
+- Planet colors kept in debugging palette:
+  - Mercury red, Venus orange, Earth blue, Mars yellow, Jupiter green, Saturn blue, Uranus purple, Neptune pink.
+- Reworked planet placement to orbital-position style:
+  - planets are no longer in one straight line,
+  - each planet keeps its distance from the Sun while being moved to new orbital angles.
+- Sun switched from sphere to flat circle for cleaner top-down composition.
+- Sun position tuned multiple times for overlap/composition with inner planets.
+- Jupiter, Saturn, Uranus, Neptune spacing adjusted repeatedly for readability.
+- Saturn ring added and tilted to match intended diagonal orientation.
+
+### Space Layers / Order
+
+- Removed all generic background stars for now (intentionally black space backdrop).
+- Added Kuiper Belt as a ring of points.
+- Added Oort Cloud as a spherical shell of points.
+- Increased Kuiper inner diameter and overall radius to clear Neptune and better match expected scale.
+- Re-centered Kuiper Belt around the Sun's orbital center.
+- Re-centered Oort Cloud around Sun centerline.
+- Moved Milky Way and Cosmic layers farther up stack so they appear at larger zoom-out scales.
+- Greatly increased Milky Way spiral size and shifted center toward top-right relative to solar system per visual reference.
+
+### Current Known Follow-ups
+
+- Sun position may still need one more final composition pass.
+- Earth texture work is intentionally simplified right now; can re-introduce water/land detail later in controlled steps.
+- Consider adding explicit orbital guides/arcs if needed for readability.
+
+### Suggested Next Step After Break
+
+1. Lock final Sun position in near-space composition (single pass, no other edits).
+2. Verify final Kuiper/Oort/Milky order visually at multiple zoom levels.
+3. Only then re-introduce Earth detail (water + land) gradually and test each layer before adding the next.
