@@ -66,6 +66,27 @@ let exponent = -1.2;
 let speed = 0.18;
 let paused = false;
 
+function createRoundSpriteTexture(size = 64) {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return null;
+  }
+  const center = size / 2;
+  const radius = size * 0.45;
+  const gradient = ctx.createRadialGradient(center, center, 0, center, center, radius);
+  gradient.addColorStop(0.0, "rgba(255,255,255,1)");
+  gradient.addColorStop(0.55, "rgba(255,255,255,0.95)");
+  gradient.addColorStop(1.0, "rgba(255,255,255,0)");
+  ctx.fillStyle = gradient;
+  ctx.beginPath();
+  ctx.arc(center, center, radius, 0, Math.PI * 2);
+  ctx.fill();
+  return new THREE.CanvasTexture(canvas);
+}
+
 function makeGround(size, color, y = -0.02) {
   const ground = new THREE.Mesh(
     new THREE.CircleGeometry(size, 48),
@@ -611,39 +632,202 @@ function createOortCloudScale() {
 
 function createGalacticScale() {
   const group = new THREE.Group();
-  const galacticCenter = new THREE.Vector3(3_800_000, -120_000_000, -3_200_000);
+  // Huge, high-in-frame galaxy: appears above Oort cloud in screen space.
+  const galacticCenter = new THREE.Vector3(55_000_000, -120_000_000, -3_600_000_000);
+  const galaxyRadius = 12_000_000_000;
+  const coreRadius = 2_200_000_000;
   const armCount = 5;
-  const starsPerArm = 2200;
-  const positions = new Float32Array(armCount * starsPerArm * 3);
+  const starsPerArm = 16_000;
+  const haloCount = 10_500;
+  const brightBodyCount = 420;
+  const roundSprite = createRoundSpriteTexture();
+  // Layered reveal: sparse first (closer), then denser farther away.
+  const sparseLayerY = 0;
+  const midLayerY = -260_000_000;
+  const denseLayerY = -560_000_000;
 
-  let cursor = 0;
+  const armPositions = new Float32Array(armCount * starsPerArm * 3);
+  const armColors = new Float32Array(armCount * starsPerArm * 3);
+  let armCursor = 0;
   for (let arm = 0; arm < armCount; arm += 1) {
     const armOffset = (arm / armCount) * Math.PI * 2;
     for (let i = 0; i < starsPerArm; i += 1) {
       const t = i / starsPerArm;
-      const radius = 5_000_000 + t * 20_000_000 + (Math.random() - 0.5) * 600_000;
-      const angle = armOffset + t * 8.0 + (Math.random() - 0.5) * 0.25;
-      positions[cursor] = galacticCenter.x + Math.cos(angle) * radius;
-      positions[cursor + 1] = galacticCenter.y + (Math.random() - 0.5) * 800_000;
-      positions[cursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
-      cursor += 3;
+      const radius = coreRadius + t * (galaxyRadius - coreRadius) + (Math.random() - 0.5) * 90_000_000;
+      const angle = armOffset + t * 10.0 + (Math.random() - 0.5) * 0.28;
+      armPositions[armCursor] = galacticCenter.x + Math.cos(angle) * radius;
+      armPositions[armCursor + 1] = galacticCenter.y + denseLayerY + (Math.random() - 0.5) * (460_000_000 + radius * 0.05);
+      armPositions[armCursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
+
+      const warmth = 0.3 + Math.random() * 0.7;
+      armColors[armCursor] = 0.65 + warmth * 0.35;
+      armColors[armCursor + 1] = 0.7 + warmth * 0.3;
+      armColors[armCursor + 2] = 0.9 + (1 - warmth) * 0.1;
+      armCursor += 3;
     }
   }
 
-  const geom = new THREE.BufferGeometry();
-  geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  const armGeom = new THREE.BufferGeometry();
+  armGeom.setAttribute("position", new THREE.BufferAttribute(armPositions, 3));
+  armGeom.setAttribute("color", new THREE.BufferAttribute(armColors, 3));
   group.add(
     new THREE.Points(
-      geom,
+      armGeom,
       new THREE.PointsMaterial({
-        color: 0xc9d4ff,
-        size: 11000,
+        size: 2_000_000,
         sizeAttenuation: true,
+        map: roundSprite,
+        alphaMap: roundSprite,
+        alphaTest: 0.15,
+        vertexColors: true,
         transparent: true,
-        opacity: 0.85,
+        opacity: 0.88,
       }),
     ),
   );
+
+  // Sparse early bodies: visible shortly after Oort.
+  const haloPositions = new Float32Array(haloCount * 3);
+  const haloColors = new Float32Array(haloCount * 3);
+  let haloCursor = 0;
+  for (let i = 0; i < haloCount; i += 1) {
+    const t = Math.pow(Math.random(), 1.15);
+    const radius = t * galaxyRadius * 1.18;
+    const angle = Math.random() * Math.PI * 2;
+    haloPositions[haloCursor] = galacticCenter.x + Math.cos(angle) * radius;
+    haloPositions[haloCursor + 1] =
+      galacticCenter.y + sparseLayerY + (Math.random() - 0.5) * (380_000_000 + radius * 0.04);
+    haloPositions[haloCursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
+    haloColors[haloCursor] = 0.55 + Math.random() * 0.2;
+    haloColors[haloCursor + 1] = 0.6 + Math.random() * 0.2;
+    haloColors[haloCursor + 2] = 0.72 + Math.random() * 0.2;
+    haloCursor += 3;
+  }
+
+  const haloGeom = new THREE.BufferGeometry();
+  haloGeom.setAttribute("position", new THREE.BufferAttribute(haloPositions, 3));
+  haloGeom.setAttribute("color", new THREE.BufferAttribute(haloColors, 3));
+  group.add(
+    new THREE.Points(
+      haloGeom,
+      new THREE.PointsMaterial({
+        size: 1_600_000,
+        sizeAttenuation: true,
+        map: roundSprite,
+        alphaMap: roundSprite,
+        alphaTest: 0.15,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.24,
+      }),
+    ),
+  );
+
+  // Mid-density arm points appear after the sparse halo and before dense spiral.
+  const midCount = Math.floor((armCount * starsPerArm) / 3);
+  const midPositions = new Float32Array(midCount * 3);
+  const midColors = new Float32Array(midCount * 3);
+  let midCursor = 0;
+  for (let i = 0; i < midCount; i += 1) {
+    const t = Math.pow(Math.random(), 1.35);
+    const radius = coreRadius + t * (galaxyRadius * 0.96 - coreRadius);
+    const arm = Math.floor(Math.random() * armCount);
+    const armOffset = (arm / armCount) * Math.PI * 2;
+    const angle = armOffset + t * 10.0 + (Math.random() - 0.5) * 0.24;
+    midPositions[midCursor] = galacticCenter.x + Math.cos(angle) * radius;
+    midPositions[midCursor + 1] = galacticCenter.y + midLayerY + (Math.random() - 0.5) * (320_000_000 + radius * 0.03);
+    midPositions[midCursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
+    const c = 0.72 + Math.random() * 0.22;
+    midColors[midCursor] = c;
+    midColors[midCursor + 1] = c;
+    midColors[midCursor + 2] = 0.9 + Math.random() * 0.1;
+    midCursor += 3;
+  }
+  const midGeom = new THREE.BufferGeometry();
+  midGeom.setAttribute("position", new THREE.BufferAttribute(midPositions, 3));
+  midGeom.setAttribute("color", new THREE.BufferAttribute(midColors, 3));
+  group.add(
+    new THREE.Points(
+      midGeom,
+      new THREE.PointsMaterial({
+        size: 1_800_000,
+        sizeAttenuation: true,
+        map: roundSprite,
+        alphaMap: roundSprite,
+        alphaTest: 0.15,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.46,
+      }),
+    ),
+  );
+
+  // Purple tint across the full Milky Way with stronger top-layer emphasis.
+  const hazeDisk = new THREE.Mesh(
+    new THREE.CircleGeometry(galaxyRadius * 0.98, 120),
+    new THREE.MeshBasicMaterial({
+      color: 0xb58cff,
+      transparent: true,
+      opacity: 0.001,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    }),
+  );
+  hazeDisk.name = "milky-haze-base";
+  hazeDisk.rotation.x = -Math.PI / 2;
+  hazeDisk.position.set(galacticCenter.x, galacticCenter.y + sparseLayerY, galacticCenter.z);
+  group.add(hazeDisk);
+
+  const hazeTop = new THREE.Mesh(
+    new THREE.CircleGeometry(galaxyRadius * 0.86, 120),
+    new THREE.MeshBasicMaterial({
+      color: 0xc7a3ff,
+      transparent: true,
+      opacity: 0.001,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    }),
+  );
+  hazeTop.name = "milky-haze-top";
+  hazeTop.rotation.x = -Math.PI / 2;
+  hazeTop.position.set(galacticCenter.x, galacticCenter.y + denseLayerY, galacticCenter.z);
+  group.add(hazeTop);
+
+  for (let i = 0; i < brightBodyCount; i += 1) {
+    const t = Math.pow(Math.random(), 1.35);
+    const radius = coreRadius + t * (galaxyRadius * 0.94 - coreRadius);
+    const arm = Math.floor(Math.random() * armCount);
+    const armOffset = (arm / armCount) * Math.PI * 2;
+    const angle = armOffset + t * 10.0 + (Math.random() - 0.5) * 0.2;
+    const body = new THREE.Mesh(
+      new THREE.SphereGeometry(4_000_000 + Math.random() * 4_000_000, 10, 8),
+      new THREE.MeshStandardMaterial({
+        color: new THREE.Color().setHSL(
+          0.02 + Math.random() * 0.62,
+          0.42 + Math.random() * 0.38,
+          0.54 + Math.random() * 0.26,
+        ),
+        roughness: 0.82,
+      }),
+    );
+    body.position.set(
+      galacticCenter.x + Math.cos(angle) * radius,
+      galacticCenter.y + denseLayerY + (Math.random() - 0.5) * (420_000_000 + radius * 0.04),
+      galacticCenter.z + Math.sin(angle) * radius,
+    );
+    group.add(body);
+  }
+
+  // Massive black hole at center, intentionally larger than Oort cloud.
+  const blackHole = new THREE.Mesh(
+    new THREE.SphereGeometry(70_000_000, 36, 24),
+    new THREE.MeshBasicMaterial({ color: 0x030303 }),
+  );
+  blackHole.position.set(galacticCenter.x, galacticCenter.y + denseLayerY, galacticCenter.z);
+  group.add(blackHole);
+
   return group;
 }
 
@@ -682,6 +866,34 @@ function setObjectOpacity(object, alpha) {
   });
 }
 
+function updateMilkyWayHaze() {
+  const milkyWay = scaleObjects.get("Milky Way");
+  if (!milkyWay) {
+    return;
+  }
+  const baseHaze = milkyWay.getObjectByName("milky-haze-base");
+  const topHaze = milkyWay.getObjectByName("milky-haze-top");
+  if (!baseHaze || !topHaze || !baseHaze.material || !topHaze.material) {
+    return;
+  }
+  // Start right after Oort begins to read in space.
+  const start = 12.0;
+  const end = 22.2;
+  const t = THREE.MathUtils.clamp((exponent - start) / (end - start), 0, 1);
+  const baseOpacity = THREE.MathUtils.lerp(0.01, 0.12, t);
+  const topOpacity = THREE.MathUtils.lerp(0.004, 0.22, t * t);
+
+  const baseMaterial = baseHaze.material;
+  baseMaterial.opacity = baseOpacity;
+  baseMaterial.transparent = true;
+  baseMaterial.depthWrite = false;
+
+  const topMaterial = topHaze.material;
+  topMaterial.opacity = topOpacity;
+  topMaterial.transparent = true;
+  topMaterial.depthWrite = false;
+}
+
 const scaleDefinitions = [
   { name: "Picnic Blanket", min: -2, max: 0.6, blend: 0.42, factory: createPicnicScale },
   { name: "Park and Trees", min: 0.25, max: 2.2, blend: 0.52, factory: createParkScale },
@@ -693,8 +905,8 @@ const scaleDefinitions = [
   { name: "Solar System", min: 8.6, max: 14, blend: 0.6, factory: createSolarScale },
   { name: "Kuiper Belt", min: 10.5, max: 16, blend: 0.6, factory: createKuiperBeltScale },
   { name: "Oort Cloud", min: 12, max: 18, blend: 0.6, factory: createOortCloudScale },
-  { name: "Milky Way", min: 14, max: 19, blend: 0.6, factory: createGalacticScale },
-  { name: "Cosmic Web", min: 19, max: 24, blend: 0.6, factory: createCosmicScale },
+  { name: "Milky Way", min: 17.4, max: 22.2, blend: 1.8, factory: createGalacticScale },
+  { name: "Cosmic Web", min: 22.2, max: 24, blend: 0.6, factory: createCosmicScale },
 ];
 
 function initializeScales() {
@@ -718,6 +930,7 @@ function updateRanges() {
       : smoothStep(def.min - def.blend, def.min + def.blend, exponent);
     setObjectOpacity(object, alpha);
   }
+  updateMilkyWayHaze();
 }
 
 function updateCamera() {
