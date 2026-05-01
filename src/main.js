@@ -122,6 +122,45 @@ function makeCar(x, z, color = 0x3f6fb1, heading = 0) {
   return car;
 }
 
+function createLyingPerson(options = {}) {
+  const person = new THREE.Group();
+  const skin = options.skin ?? 0xe6b48c;
+  const shirt = options.shirt ?? 0x5678c9;
+  const pants = options.pants ?? 0x2f3e62;
+
+  const head = new THREE.Mesh(
+    new THREE.SphereGeometry(0.11, 12, 10),
+    new THREE.MeshStandardMaterial({ color: skin, roughness: 0.85 }),
+  );
+  head.position.set(-0.45, 0.155, 0);
+  person.add(head);
+
+  const torso = new THREE.Mesh(
+    // Single tapered body: narrower near neck, wider toward hips.
+    new THREE.CylinderGeometry(0.06, 0.17, 0.5, 12),
+    new THREE.MeshStandardMaterial({ color: shirt, roughness: 0.9 }),
+  );
+  torso.rotation.z = Math.PI / 2;
+  torso.position.set(-0.12, 0.11, 0);
+  person.add(torso);
+
+  const leftLeg = new THREE.Mesh(
+    new THREE.BoxGeometry(0.45, 0.1, 0.12),
+    new THREE.MeshStandardMaterial({ color: pants, roughness: 0.92 }),
+  );
+  leftLeg.position.set(0.34, 0.08, -0.08);
+  person.add(leftLeg);
+
+  const rightLeg = new THREE.Mesh(
+    new THREE.BoxGeometry(0.45, 0.1, 0.12),
+    new THREE.MeshStandardMaterial({ color: pants, roughness: 0.92 }),
+  );
+  rightLeg.position.set(0.34, 0.08, 0.08);
+  person.add(rightLeg);
+
+  return person;
+}
+
 function randomPointInRing(innerR, outerR) {
   const t = Math.random();
   const radius = Math.sqrt(innerR * innerR + t * (outerR * outerR - innerR * innerR));
@@ -269,6 +308,45 @@ function createPicnicScale() {
       group.add(tile);
     }
   }
+
+  const personA = createLyingPerson({
+    skin: 0xe8bd99,
+    shirt: 0x4f79b8,
+    pants: 0x273551,
+  });
+  personA.position.set(-0.34, 0.02, 0.06);
+  personA.rotation.y = -Math.PI / 2;
+  group.add(personA);
+
+  const personB = createLyingPerson({
+    skin: 0xc99774,
+    shirt: 0xd07b4d,
+    pants: 0x4a2f26,
+  });
+  personB.position.set(0.34, 0.02, -0.06);
+  personB.rotation.y = -Math.PI / 2;
+  group.add(personB);
+
+  const basketGroup = new THREE.Group();
+  basketGroup.position.set(0.02, 0.1, -0.1);
+  basketGroup.rotation.y = 0.35;
+
+  const picnicBasket = new THREE.Mesh(
+    new THREE.BoxGeometry(0.22, 0.14, 0.16),
+    new THREE.MeshStandardMaterial({ color: 0x8b5a2b, roughness: 0.92 }),
+  );
+  basketGroup.add(picnicBasket);
+
+  const basketHandle = new THREE.Mesh(
+    new THREE.TorusGeometry(0.05, 0.008, 10, 24, Math.PI),
+    new THREE.MeshStandardMaterial({ color: 0x6e4522, roughness: 0.9 }),
+  );
+  basketHandle.rotation.y = Math.PI / 2;
+  basketHandle.rotation.z = 0.2;
+  basketHandle.position.set(0, 0.085, 0);
+  basketGroup.add(basketHandle);
+
+  group.add(basketGroup);
 
   return group;
 }

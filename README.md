@@ -212,3 +212,29 @@ This section captures the major changes made today so work can resume cleanly.
 1. Lock final Sun position in near-space composition (single pass, no other edits).
 2. Verify final Kuiper/Oort/Milky order visually at multiple zoom levels.
 3. Only then re-introduce Earth detail (water + land) gradually and test each layer before adding the next.
+
+## Progress Log - 2026-05-01 (Morning)
+
+### Picnic Character + Prop Pass
+
+- Refined the two people on the blanket:
+  - switched to single tapered torso body shape,
+  - shortened torso length to improve proportions,
+  - aligned head-to-body connection better,
+  - rotated both to lie toward the target blanket edge,
+  - moved them inward/outward iteratively so they stay on the mat and avoid clipping.
+- Added a simple picnic basket between the two people.
+- Added a basket handle and converted basket+handle into one grouped object so transforms stay consistent.
+- Tuned basket placement:
+  - moved slightly up/right between people,
+  - applied slight angle,
+  - reduced handle size,
+  - fixed handle orientation so it sticks up from the top instead of laying flat on the basket face.
+
+### Notes for Next Session
+
+- Add small food/fruit props around the basket (simple low-poly meshes are fine).
+- Main priority remains Earth-side world quality:
+  - improve Earth texture/look (water + land shape quality, reduce artifacts),
+  - improve major Earth objects/readability at larger scales (houses, trees, TV towers/large structures, etc.),
+  - continue making Earth feel fuller and more believable while keeping one-scene continuity.
