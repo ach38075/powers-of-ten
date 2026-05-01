@@ -270,20 +270,6 @@ function createPicnicScale() {
     }
   }
 
-  const bugBody = new THREE.Mesh(
-    new THREE.SphereGeometry(0.055, 16, 12),
-    new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.45 }),
-  );
-  bugBody.position.set(0.16, 0.09, 0.04);
-  group.add(bugBody);
-
-  const bugShell = new THREE.Mesh(
-    new THREE.SphereGeometry(0.045, 16, 12),
-    new THREE.MeshStandardMaterial({ color: 0xd22727, roughness: 0.5 }),
-  );
-  bugShell.position.set(0.16, 0.102, 0.04);
-  group.add(bugShell);
-
   return group;
 }
 
@@ -477,8 +463,10 @@ function createKuiperBeltScale() {
   const group = new THREE.Group();
   // Match the Sun center in x/z so the belt is truly sun-centered.
   const center = new THREE.Vector3(-780_000, -1_200_000, 0);
-  const count = 14000;
+  const count = 32000;
   const positions = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  const rockPalette = [0xc8c8c8, 0xb8bcc2, 0xd6d6d6, 0xaeb3b9];
   for (let i = 0; i < count; i += 1) {
     const angle = Math.random() * Math.PI * 2;
     const radius = 2_100_000 + Math.random() * 1_400_000;
@@ -486,18 +474,24 @@ function createKuiperBeltScale() {
     positions[idx] = center.x + Math.cos(angle) * radius;
     positions[idx + 1] = center.y + (Math.random() - 0.5) * 40_000;
     positions[idx + 2] = center.z + Math.sin(angle) * radius;
+
+    const color = new THREE.Color(rockPalette[Math.floor(Math.random() * rockPalette.length)]);
+    colors[idx] = color.r;
+    colors[idx + 1] = color.g;
+    colors[idx + 2] = color.b;
   }
   const geom = new THREE.BufferGeometry();
   geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
   group.add(
     new THREE.Points(
       geom,
       new THREE.PointsMaterial({
-        color: 0xbec8d9,
-        size: 34,
+        vertexColors: true,
+        size: 62,
         sizeAttenuation: true,
         transparent: true,
-        opacity: 0.88,
+        opacity: 0.92,
       }),
     ),
   );
@@ -526,11 +520,11 @@ function createOortCloudScale() {
     new THREE.Points(
       geom,
       new THREE.PointsMaterial({
-        color: 0xe2e8f5,
-        size: 44,
+        color: 0xd8ecff,
+        size: 42,
         sizeAttenuation: true,
         transparent: true,
-        opacity: 0.58,
+        opacity: 0.5,
       }),
     ),
   );
