@@ -1,111 +1,450 @@
 import * as THREE from "three";
 import "./style.css";
 
-const canvases = Array.from(document.querySelectorAll("#app"));
-const canvas = canvases[0];
-for (let i = 1; i < canvases.length; i += 1) {
-  canvases[i].remove();
-}
-const scaleLabel = document.querySelector("#scale-label");
+// ============================================================================
+// Renderer + DOM setup
+// ============================================================================
 
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+const canvas = document.querySelector("#app");
+const scaleLabel = document.querySelector("#scale-label");
+const statusLabel = document.querySelector("#status");
+
+const renderer = new THREE.WebGLRenderer({
+  canvas,
+  antialias: true,
+  // Allows sane depth precision when near~10^-4 and far~10^23+ in the same frame.
+  logarithmicDepthBuffer: true,
+});
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
+const maxAniso = renderer.capabilities.getMaxAnisotropy();
 
 const scene = new THREE.Scene();
 scene.fog = null;
 
+// Initial planes; updateCamera assigns values that always bound the full scene.
 const camera = new THREE.PerspectiveCamera(
   60,
   window.innerWidth / window.innerHeight,
-  0.1,
-  20_000,
+  1e-4,
+  1e24,
 );
 
-const ambient = new THREE.AmbientLight(0x6f84aa, 0.35);
+const ambient = new THREE.AmbientLight(0x6f84aa, 0.48);
 scene.add(ambient);
-ambient.intensity = 0.48;
 
-const sunLight = new THREE.DirectionalLight(0xffffff, 1.2);
+const sunLight = new THREE.DirectionalLight(0xffffff, 1.35);
 sunLight.position.set(600, 400, 300);
 scene.add(sunLight);
-sunLight.intensity = 1.35;
 
-const world = new THREE.Group();
-scene.add(world);
+// ============================================================================
+// Constants + state
+// ============================================================================
 
-const tmpVec = new THREE.Vector3();
-const scaleObjects = new Map();
-const ALWAYS_ON_LAYERS = new Set([
-  "Earth",
-  "Near Space",
-  "Solar System",
-  "Kuiper Belt",
-  "Oort Cloud",
-  "Milky Way",
-  "Cosmic Web",
-]);
+// Direct reference for animated scene content; populated in setupScene().
+let cloudDisk = null;
+
 const metersPerWorldUnit = 1;
 const EARTH_RADIUS = 6700;
-const LAND_REGIONS = [
-  { x: -1800, z: -900, r: 1900 },
-  { x: 1400, z: -1100, r: 1600 },
-  { x: -500, z: 1800, r: 1500 },
-  { x: 2200, z: 1500, r: 1200 },
-  { x: -2600, z: 1500, r: 1100 },
-  { x: 3200, z: -900, r: 1000 },
-  { x: -3300, z: -1400, r: 900 },
-  { x: 2700, z: 2700, r: 850 },
-  { x: -800, z: -3100, r: 950 },
+
+// Furthest scene content (Cosmic Web, galaxy, Oort) sits within ~this distance of
+// the origin. Camera looks at origin from +Y; without (distanceWorld + margin) in
+// `far`, bodies like the Kuiper belt pop in only once 5*distanceWorld exceeds their
+// depth — the "choppy layer" effect.
+const SCENE_RADIUS =
+  90_000_000_000;
+
+// Shared between createCityScale (towers) and the Earth texture (city lights)
+// so the warm dots visible from space line up with where towers appear up close.
+const CITY_CENTERS = [
+  { x: -1700, z: 1300 },
+  { x: 2200, z: -900 },
+  { x: -500, z: -2300 },
+  { x: 1800, z: 2000 },
 ];
+
+// CONTINENTS is the source of truth for land. The Earth texture renders shorelines
+// from these via noise; LAND_REGIONS is the bounding-circle fallback used by simpler
+// placement helpers (isLandAt / projectToLand) to keep house and city placement cheap.
+const CONTINENTS = [
+  { x: 200, z: -100, r: 1700, seed: 5.5, biomeBias: 0.3 },
+  { x: -1800, z: -900, r: 1900, seed: 11.7, biomeBias: 0.4 },
+  { x: 1400, z: -1100, r: 1600, seed: 27.3, biomeBias: 0.55 },
+  { x: -500, z: 1800, r: 1500, seed: 41.9, biomeBias: 0.45 },
+  { x: 2200, z: 1500, r: 1200, seed: 58.6, biomeBias: 0.65 },
+  { x: -2600, z: 1500, r: 1100, seed: 73.2, biomeBias: 0.5 },
+  { x: 3200, z: -900, r: 1000, seed: 89.4, biomeBias: 0.7 },
+  { x: -3300, z: -1400, r: 900, seed: 102.8, biomeBias: 0.55 },
+  { x: 2700, z: 2700, r: 850, seed: 118.1, biomeBias: 0.6 },
+  { x: -800, z: -3100, r: 950, seed: 131.5, biomeBias: 0.45 },
+];
+const LAND_REGIONS = CONTINENTS.map(({ x, z, r }) => ({ x, z, r }));
+
 const minExponent = -1.7;
 const maxExponent = 23;
 
-let exponent = -1.2;
+/** Initial zoom when the page loads (tight on the blanket). */
+const DEFAULT_EXPONENT = -1.2;
+/**
+ * Tour return altitude: ~10^0.3 m ≈ 2 m camera height so the full picnic
+ * blanket fits in a 60° vertical FOV; DEFAULT_EXPONENT is too close for that.
+ */
+const TOUR_RETURN_EXPONENT = 0.3;
+/** Overview landmark (~10^10.65 m). */
+const OVERVIEW_EXPONENT = 10.65;
+const OVERVIEW_TOUR_OUT_SECONDS = 14;
+const OVERVIEW_TOUR_IN_SECONDS = 12;
+
+let exponent = DEFAULT_EXPONENT;
 let speed = 0.18;
+let direction = 1;
 let paused = false;
 
+/**
+ * @type {{
+ *   phase: "out" | "in";
+ *   elapsed: number;
+ *   duration: number;
+ *   from: number;
+ *   to: number;
+ * } | null}
+ */
+let overviewTour = null;
+
+// ============================================================================
+// Inline 2D value noise (zero deps)
+// ============================================================================
+
+function hash2(ix, iy) {
+  const h = Math.sin(ix * 127.1 + iy * 311.7) * 43758.5453;
+  return h - Math.floor(h);
+}
+
+function smoothT(t) {
+  return t * t * (3 - 2 * t);
+}
+
+function valueNoise2D(x, y) {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const fx = x - ix;
+  const fy = y - iy;
+  const a = hash2(ix, iy);
+  const b = hash2(ix + 1, iy);
+  const c = hash2(ix, iy + 1);
+  const d = hash2(ix + 1, iy + 1);
+  const u = smoothT(fx);
+  const v = smoothT(fy);
+  return a * (1 - u) * (1 - v) + b * u * (1 - v) + c * (1 - u) * v + d * u * v;
+}
+
+function fbm2D(x, y, octaves = 4) {
+  let amp = 0.5;
+  let freq = 1;
+  let sum = 0;
+  for (let i = 0; i < octaves; i += 1) {
+    sum += amp * valueNoise2D(x * freq, y * freq);
+    amp *= 0.5;
+    freq *= 2;
+  }
+  return sum;
+}
+
+// ============================================================================
+// Sprite + procedural texture helpers
+// ============================================================================
+
 function createRoundSpriteTexture(size = 64) {
-  const canvas = document.createElement("canvas");
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d");
+  const spriteCanvas = document.createElement("canvas");
+  spriteCanvas.width = size;
+  spriteCanvas.height = size;
+  const ctx = spriteCanvas.getContext("2d");
   if (!ctx) {
     return null;
   }
   const center = size / 2;
   const radius = size * 0.45;
-  const gradient = ctx.createRadialGradient(center, center, 0, center, center, radius);
-  gradient.addColorStop(0.0, "rgba(255,255,255,1)");
-  gradient.addColorStop(0.55, "rgba(255,255,255,0.95)");
-  gradient.addColorStop(1.0, "rgba(255,255,255,0)");
-  ctx.fillStyle = gradient;
+  const grad = ctx.createRadialGradient(
+    center,
+    center,
+    0,
+    center,
+    center,
+    radius,
+  );
+  grad.addColorStop(0.0, "rgba(255,255,255,1)");
+  grad.addColorStop(0.55, "rgba(255,255,255,0.95)");
+  grad.addColorStop(1.0, "rgba(255,255,255,0)");
+  ctx.fillStyle = grad;
   ctx.beginPath();
   ctx.arc(center, center, radius, 0, Math.PI * 2);
   ctx.fill();
-  return new THREE.CanvasTexture(canvas);
+  const tex = new THREE.CanvasTexture(spriteCanvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
 }
 
-function makeGround(size, color, y = -0.02) {
-  const ground = new THREE.Mesh(
-    new THREE.CircleGeometry(size, 48),
-    new THREE.MeshStandardMaterial({ color, roughness: 1.0, metalness: 0.0 }),
+function createEarthTexture(size = 1536) {
+  const earthCanvas = document.createElement("canvas");
+  earthCanvas.width = size;
+  earthCanvas.height = size;
+  const ctx = earthCanvas.getContext("2d");
+
+  const worldToPx = (w) => ((w / EARTH_RADIUS + 1) / 2) * size;
+  const lengthToPx = (l) => (l / EARTH_RADIUS) * (size / 2);
+
+  // Ocean radial base.
+  const oceanGrad = ctx.createRadialGradient(
+    size / 2,
+    size / 2,
+    0,
+    size / 2,
+    size / 2,
+    size * 0.5,
   );
-  ground.rotation.x = -Math.PI / 2;
-  ground.position.y = y;
-  return ground;
+  oceanGrad.addColorStop(0.0, "#143a6b");
+  oceanGrad.addColorStop(0.6, "#0d2c52");
+  oceanGrad.addColorStop(1.0, "#08213e");
+  ctx.fillStyle = oceanGrad;
+  ctx.fillRect(0, 0, size, size);
+
+  // Per-continent shoreline polygon + biome detail + coastline + lakes.
+  for (const continent of CONTINENTS) {
+    const POINTS = 128;
+    const polygon = new Path2D();
+    for (let i = 0; i < POINTS; i += 1) {
+      const angle = (i / POINTS) * Math.PI * 2;
+      const cosA = Math.cos(angle);
+      const sinA = Math.sin(angle);
+      const noise = fbm2D(
+        cosA * 1.6 + continent.seed,
+        sinA * 1.6 + continent.seed,
+        4,
+      );
+      const radius = continent.r * (0.78 + 0.34 * noise);
+      const xPx = worldToPx(continent.x + cosA * radius);
+      const yPx = worldToPx(continent.z + sinA * radius);
+      if (i === 0) {
+        polygon.moveTo(xPx, yPx);
+      } else {
+        polygon.lineTo(xPx, yPx);
+      }
+    }
+    polygon.closePath();
+
+    ctx.fillStyle = "#2c6c3b";
+    ctx.fill(polygon);
+
+    // Biome detail: per-pixel sampling within the continent bounding box, clipped
+    // to the polygon. Bounding box keeps cost proportional to actual land area.
+    ctx.save();
+    ctx.clip(polygon);
+    const bboxR = continent.r * 1.15;
+    const x0 = Math.max(0, Math.floor(worldToPx(continent.x - bboxR)));
+    const y0 = Math.max(0, Math.floor(worldToPx(continent.z - bboxR)));
+    const x1 = Math.min(size, Math.ceil(worldToPx(continent.x + bboxR)));
+    const y1 = Math.min(size, Math.ceil(worldToPx(continent.z + bboxR)));
+    const w = x1 - x0;
+    const h = y1 - y0;
+    if (w > 0 && h > 0) {
+      const img = ctx.getImageData(x0, y0, w, h);
+      const data = img.data;
+      for (let py = 0; py < h; py += 1) {
+        for (let px = 0; px < w; px += 1) {
+          const idx = (py * w + px) * 4;
+          if (data[idx + 3] === 0) {
+            continue;
+          }
+          const wx = (((x0 + px) / size) * 2 - 1) * EARTH_RADIUS;
+          const wy = (((y0 + py) / size) * 2 - 1) * EARTH_RADIUS;
+          const elev = fbm2D(
+            wx * 0.0009 + continent.seed,
+            wy * 0.0009 - continent.seed,
+            4,
+          );
+          const biome = elev + continent.biomeBias * 0.18;
+
+          let r = 44;
+          let g = 108;
+          let b = 59;
+          if (biome > 0.66) {
+            r = 110;
+            g = 98;
+            b = 86;
+          } else if (biome > 0.55) {
+            r = 200;
+            g = 167;
+            b = 106;
+          } else if (biome > 0.42) {
+            r = 111;
+            g = 156;
+            b = 74;
+          }
+
+          const lat = Math.abs(wy) / EARTH_RADIUS;
+          if (lat > 0.78) {
+            const t = Math.min(1, (lat - 0.78) / 0.22);
+            r = Math.round(r * (1 - t) + 232 * t);
+            g = Math.round(g * (1 - t) + 240 * t);
+            b = Math.round(b * (1 - t) + 246 * t);
+          }
+
+          data[idx] = r;
+          data[idx + 1] = g;
+          data[idx + 2] = b;
+        }
+      }
+      ctx.putImageData(img, x0, y0);
+    }
+    ctx.restore();
+
+    ctx.strokeStyle = "rgba(15, 35, 55, 0.55)";
+    ctx.lineWidth = 2;
+    ctx.stroke(polygon);
+
+    if (continent.r >= 1300) {
+      const lakeCount = 1 + Math.floor((continent.r - 1300) / 400);
+      for (let li = 0; li < lakeCount; li += 1) {
+        const lx =
+          continent.x +
+          (fbm2D(continent.seed + li * 7.7, li * 3.1) - 0.5) *
+            continent.r *
+            0.6;
+        const ly =
+          continent.z +
+          (fbm2D(continent.seed + li * 5.3, li * 9.1 + 13) - 0.5) *
+            continent.r *
+            0.6;
+        const lr = 60 + fbm2D(continent.seed + li, li * 2.4) * 110;
+        ctx.beginPath();
+        ctx.arc(worldToPx(lx), worldToPx(ly), lengthToPx(lr), 0, Math.PI * 2);
+        ctx.fillStyle = "#0d2c52";
+        ctx.fill();
+      }
+    }
+  }
+
+  // City lights (warm dots visible from space).
+  for (const cc of CITY_CENTERS) {
+    const cxPx = worldToPx(cc.x);
+    const cyPx = worldToPx(cc.z);
+    const grad = ctx.createRadialGradient(cxPx, cyPx, 0, cxPx, cyPx, 28);
+    grad.addColorStop(0.0, "rgba(255,212,138,0.95)");
+    grad.addColorStop(0.55, "rgba(255,180,90,0.4)");
+    grad.addColorStop(1.0, "rgba(255,180,90,0)");
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(cxPx, cyPx, 28, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  const tex = new THREE.CanvasTexture(earthCanvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAniso;
+  return tex;
 }
+
+function createCloudTexture(size = 512) {
+  const cloudCanvas = document.createElement("canvas");
+  cloudCanvas.width = size;
+  cloudCanvas.height = size;
+  const ctx = cloudCanvas.getContext("2d");
+  const img = ctx.createImageData(size, size);
+  const data = img.data;
+  for (let py = 0; py < size; py += 1) {
+    for (let px = 0; px < size; px += 1) {
+      const idx = (py * size + px) * 4;
+      const dx = px - size / 2;
+      const dy = py - size / 2;
+      const r = Math.hypot(dx, dy) / (size / 2);
+      if (r > 0.99) {
+        data[idx + 3] = 0;
+        continue;
+      }
+      const wx = (px / size) * 8;
+      const wy = (py / size) * 8;
+      const n = fbm2D(wx, wy, 4);
+      const a = Math.max(0, n - 0.55) * 280;
+      data[idx] = 245;
+      data[idx + 1] = 248;
+      data[idx + 2] = 252;
+      data[idx + 3] = Math.min(220, a) * (1 - r * 0.3);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(cloudCanvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function createCloudLayer() {
+  const wrapper = new THREE.Group();
+  wrapper.name = "earth-clouds";
+  wrapper.rotation.x = -Math.PI / 2;
+  wrapper.position.y = 0.5;
+
+  const disk = new THREE.Mesh(
+    new THREE.CircleGeometry(EARTH_RADIUS * 0.999, 128),
+    new THREE.MeshBasicMaterial({
+      map: createCloudTexture(),
+      transparent: true,
+      depthWrite: false,
+      opacity: 0.7,
+    }),
+  );
+  disk.name = "earth-clouds-disk";
+  wrapper.add(disk);
+  return wrapper;
+}
+
+function createAtmosphereRing() {
+  const group = new THREE.Group();
+  group.name = "earth-atmosphere";
+  // Stacked rings of decreasing opacity approximate a soft fade outward without
+  // requiring a custom shader or a baked ring texture with awkward UV mapping.
+  const layers = [
+    { inner: 1.0, outer: 1.012, opacity: 0.55 },
+    { inner: 1.012, outer: 1.025, opacity: 0.32 },
+    { inner: 1.025, outer: 1.045, opacity: 0.18 },
+    { inner: 1.045, outer: 1.07, opacity: 0.08 },
+  ];
+  for (const layer of layers) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(
+        EARTH_RADIUS * layer.inner,
+        EARTH_RADIUS * layer.outer,
+        96,
+      ),
+      new THREE.MeshBasicMaterial({
+        color: 0x8cc8ff,
+        transparent: true,
+        opacity: layer.opacity,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+      }),
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.3;
+    group.add(ring);
+  }
+  return group;
+}
+
+// ============================================================================
+// Picnic-scale primitives + placement helpers
+// ============================================================================
 
 function makeTree(x, z, trunkHeight = 8, crownRadius = 3.2) {
   const group = new THREE.Group();
   const trunk = new THREE.Mesh(
     new THREE.CylinderGeometry(0.6, 0.8, trunkHeight, 8),
-    new THREE.MeshStandardMaterial({ color: 0x5b3b2b, roughness: 1.0 }),
+    new THREE.MeshLambertMaterial({ color: 0x5b3b2b }),
   );
   const crown = new THREE.Mesh(
     new THREE.SphereGeometry(crownRadius, 12, 10),
-    new THREE.MeshStandardMaterial({ color: 0x315b2d, roughness: 0.95 }),
+    new THREE.MeshLambertMaterial({ color: 0x315b2d }),
   );
   trunk.position.y = trunkHeight / 2;
   crown.position.y = trunkHeight + crownRadius * 0.65;
@@ -118,29 +457,10 @@ function makeTree(x, z, trunkHeight = 8, crownRadius = 3.2) {
 function makeBush(x, z, scale = 1) {
   const bush = new THREE.Mesh(
     new THREE.SphereGeometry(1.25 * scale, 10, 8),
-    new THREE.MeshStandardMaterial({ color: 0x2f5a2e, roughness: 1.0 }),
+    new THREE.MeshLambertMaterial({ color: 0x2f5a2e }),
   );
   bush.position.set(x, 1 * scale, z);
   return bush;
-}
-
-function makeCar(x, z, color = 0x3f6fb1, heading = 0) {
-  const car = new THREE.Group();
-  const body = new THREE.Mesh(
-    new THREE.BoxGeometry(7.2, 1.6, 3.8),
-    new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.25 }),
-  );
-  body.position.y = 1.2;
-  const cabin = new THREE.Mesh(
-    new THREE.BoxGeometry(3.5, 1.3, 3.2),
-    new THREE.MeshStandardMaterial({ color: 0xcfd7e6, roughness: 0.45, metalness: 0.15 }),
-  );
-  cabin.position.set(0.5, 2.15, 0);
-  car.add(body);
-  car.add(cabin);
-  car.position.set(x, 0, z);
-  car.rotation.y = heading;
-  return car;
 }
 
 function createLyingPerson(options = {}) {
@@ -156,8 +476,8 @@ function createLyingPerson(options = {}) {
   head.position.set(-0.45, 0.155, 0);
   person.add(head);
 
+  // Single tapered body: narrower near neck, wider toward hips.
   const torso = new THREE.Mesh(
-    // Single tapered body: narrower near neck, wider toward hips.
     new THREE.CylinderGeometry(0.06, 0.17, 0.5, 12),
     new THREE.MeshStandardMaterial({ color: shirt, roughness: 0.9 }),
   );
@@ -184,7 +504,9 @@ function createLyingPerson(options = {}) {
 
 function randomPointInRing(innerR, outerR) {
   const t = Math.random();
-  const radius = Math.sqrt(innerR * innerR + t * (outerR * outerR - innerR * innerR));
+  const radius = Math.sqrt(
+    innerR * innerR + t * (outerR * outerR - innerR * innerR),
+  );
   const angle = Math.random() * Math.PI * 2;
   return { x: Math.cos(angle) * radius, z: Math.sin(angle) * radius };
 }
@@ -200,7 +522,9 @@ function clampToEarth(x, z, margin = 0) {
 }
 
 function isLandAt(x, z) {
-  return LAND_REGIONS.some((land) => (x - land.x) ** 2 + (z - land.z) ** 2 < land.r ** 2);
+  return LAND_REGIONS.some(
+    (land) => (x - land.x) ** 2 + (z - land.z) ** 2 < land.r ** 2,
+  );
 }
 
 function projectToLand(x, z) {
@@ -222,6 +546,10 @@ function projectToLand(x, z) {
   return best ? { x: best.x, z: best.z } : { x, z };
 }
 
+// ============================================================================
+// Neighborhood (instanced houses)
+// ============================================================================
+
 function addNeighborhoodCluster(group, centerX, centerZ, options = {}) {
   const anchored = projectToLand(centerX, centerZ);
   centerX = anchored.x;
@@ -229,7 +557,7 @@ function addNeighborhoodCluster(group, centerX, centerZ, options = {}) {
   const roads = options.roads ?? 4;
   const span = options.span ?? 680;
   const spacing = span / roads;
-  const roadMaterial = new THREE.MeshStandardMaterial({ color: 0x2f2f34, roughness: 0.95 });
+  const roadMaterial = new THREE.MeshLambertMaterial({ color: 0x2f2f34 });
 
   for (let i = -roads + 1; i <= roads - 1; i += 1) {
     const roadA = new THREE.Mesh(
@@ -249,7 +577,10 @@ function addNeighborhoodCluster(group, centerX, centerZ, options = {}) {
     group.add(roadB);
   }
 
+  // First pass collects house specs; second pass batches into a single
+  // InstancedMesh so the cluster costs one draw call instead of dozens.
   const occupied = [];
+  const houseSpecs = [];
   for (let bx = -roads; bx < roads; bx += 1) {
     for (let bz = -roads; bz < roads; bz += 1) {
       const blockCenterX = centerX + (bx + 0.5) * spacing;
@@ -263,7 +594,8 @@ function addNeighborhoodCluster(group, centerX, centerZ, options = {}) {
             z: blockCenterZ + (Math.random() - 0.5) * (spacing * 0.55),
           };
           const tooClose = occupied.some(
-            (p) => (candidate.x - p.x) ** 2 + (candidate.z - p.z) ** 2 < 34 ** 2,
+            (p) =>
+              (candidate.x - p.x) ** 2 + (candidate.z - p.z) ** 2 < 34 ** 2,
           );
           if (!tooClose) {
             housePos = candidate;
@@ -273,36 +605,74 @@ function addNeighborhoodCluster(group, centerX, centerZ, options = {}) {
         if (!housePos) {
           continue;
         }
-
         if (!isLandAt(housePos.x, housePos.z)) {
           continue;
         }
-        const house = new THREE.Mesh(
-          new THREE.BoxGeometry(18 + Math.random() * 14, 12 + Math.random() * 20, 16 + Math.random() * 12),
-          new THREE.MeshStandardMaterial({
-            color: new THREE.Color().setHSL(0.03 + Math.random() * 0.08, 0.45, 0.52 + Math.random() * 0.18),
-            roughness: 0.9,
-          }),
-        );
-        house.position.set(housePos.x, house.geometry.parameters.height / 2, housePos.z);
-        house.rotation.y = (Math.random() - 0.5) * 1.0;
-        group.add(house);
+        houseSpecs.push({
+          x: housePos.x,
+          z: housePos.z,
+          w: 18 + Math.random() * 14,
+          h: 12 + Math.random() * 20,
+          d: 16 + Math.random() * 12,
+          rotY: (Math.random() - 0.5) * 1.0,
+          color: new THREE.Color().setHSL(
+            0.03 + Math.random() * 0.08,
+            0.45,
+            0.52 + Math.random() * 0.18,
+          ),
+        });
         occupied.push(housePos);
+      }
+    }
+  }
 
-        if (Math.random() < 0.65) {
-          const treeSpot = clampToEarth(
-            house.position.x + 12 + (Math.random() - 0.5) * 10,
-            house.position.z + 12 + (Math.random() - 0.5) * 10,
-            40,
-          );
-          if (isLandAt(treeSpot.x, treeSpot.z)) {
-            group.add(makeTree(treeSpot.x, treeSpot.z, 5 + Math.random() * 4, 2 + Math.random()));
-          }
-        }
+  if (houseSpecs.length > 0) {
+    const houses = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(1, 1, 1),
+      new THREE.MeshLambertMaterial(),
+      houseSpecs.length,
+    );
+    const dummy = new THREE.Object3D();
+    for (let i = 0; i < houseSpecs.length; i += 1) {
+      const s = houseSpecs[i];
+      dummy.position.set(s.x, s.h / 2, s.z);
+      dummy.rotation.set(0, s.rotY, 0);
+      dummy.scale.set(s.w, s.h, s.d);
+      dummy.updateMatrix();
+      houses.setMatrixAt(i, dummy.matrix);
+      houses.setColorAt(i, s.color);
+    }
+    houses.instanceMatrix.needsUpdate = true;
+    if (houses.instanceColor) {
+      houses.instanceColor.needsUpdate = true;
+    }
+    group.add(houses);
+  }
+
+  for (const s of houseSpecs) {
+    if (Math.random() < 0.65) {
+      const treeSpot = clampToEarth(
+        s.x + 12 + (Math.random() - 0.5) * 10,
+        s.z + 12 + (Math.random() - 0.5) * 10,
+        40,
+      );
+      if (isLandAt(treeSpot.x, treeSpot.z)) {
+        group.add(
+          makeTree(
+            treeSpot.x,
+            treeSpot.z,
+            5 + Math.random() * 4,
+            2 + Math.random(),
+          ),
+        );
       }
     }
   }
 }
+
+// ============================================================================
+// Scale factories
+// ============================================================================
 
 function createPicnicScale() {
   const group = new THREE.Group();
@@ -332,8 +702,8 @@ function createPicnicScale() {
 
   const personA = createLyingPerson({
     skin: 0xe8bd99,
-    shirt: 0x4f79b8,
-    pants: 0x273551,
+    shirt: 0xff46a2,
+    pants: 0x420453,
   });
   personA.position.set(-0.34, 0.02, 0.06);
   personA.rotation.y = -Math.PI / 2;
@@ -392,42 +762,50 @@ function createParkScale() {
 function createNeighborhoodScale() {
   const group = new THREE.Group();
   addNeighborhoodCluster(group, 560, 420, { roads: 3, span: 420 });
-
   return group;
 }
 
 function createCityScale() {
   const group = new THREE.Group();
-  const cityCenters = [
-    new THREE.Vector2(-1700, 1300),
-    new THREE.Vector2(2200, -900),
-    new THREE.Vector2(-500, -2300),
-    new THREE.Vector2(1800, 2000),
-  ];
-  for (const cityCenter of cityCenters) {
-    for (let i = 0; i < 16; i += 1) {
-    const tower = new THREE.Mesh(
-      new THREE.BoxGeometry(65 + Math.random() * 70, 200 + Math.random() * 700, 65 + Math.random() * 70),
-      new THREE.MeshStandardMaterial({
-        color: new THREE.Color().setHSL(0.58, 0.05, 0.36 + Math.random() * 0.22),
-        roughness: 0.84,
-      }),
-    );
-    const angle = (i / 16) * Math.PI * 2 + (Math.random() - 0.5) * 0.25;
-    const radius = 260 + Math.random() * 620;
-    const projected = clampToEarth(
-      cityCenter.x + Math.cos(angle) * radius,
-      cityCenter.y + Math.sin(angle) * radius,
-      420,
-    );
-    const x = projected.x;
-    const z = projected.z;
-    tower.position.set(x, tower.geometry.parameters.height / 2, z);
-    group.add(tower);
-  }
-  }
 
-  // Additional neighborhoods appear on the outskirts at larger scales.
+  const totalTowers = CITY_CENTERS.length * 16;
+  const towers = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshLambertMaterial(),
+    totalTowers,
+  );
+  const dummy = new THREE.Object3D();
+  const color = new THREE.Color();
+  let towerIdx = 0;
+  for (const center of CITY_CENTERS) {
+    for (let i = 0; i < 16; i += 1) {
+      const w = 65 + Math.random() * 70;
+      const h = 200 + Math.random() * 700;
+      const d = 65 + Math.random() * 70;
+      const angle = (i / 16) * Math.PI * 2 + (Math.random() - 0.5) * 0.25;
+      const radius = 260 + Math.random() * 620;
+      const projected = clampToEarth(
+        center.x + Math.cos(angle) * radius,
+        center.z + Math.sin(angle) * radius,
+        420,
+      );
+      dummy.position.set(projected.x, h / 2, projected.z);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.set(w, h, d);
+      dummy.updateMatrix();
+      towers.setMatrixAt(towerIdx, dummy.matrix);
+      color.setHSL(0.58, 0.05, 0.36 + Math.random() * 0.22);
+      towers.setColorAt(towerIdx, color);
+      towerIdx += 1;
+    }
+  }
+  towers.instanceMatrix.needsUpdate = true;
+  if (towers.instanceColor) {
+    towers.instanceColor.needsUpdate = true;
+  }
+  group.add(towers);
+
+  // Outskirt neighborhoods so cities feel embedded in suburbs at larger zooms.
   addNeighborhoodCluster(group, -2200, -300, { roads: 3, span: 420 });
   addNeighborhoodCluster(group, 2100, 1700, { roads: 2, span: 360 });
   addNeighborhoodCluster(group, -500, 2400, { roads: 2, span: 340 });
@@ -435,46 +813,22 @@ function createCityScale() {
   return group;
 }
 
-function addStarField(radius, count, color, size) {
-  const geometry = new THREE.BufferGeometry();
-  const positions = new Float32Array(count * 3);
-  for (let i = 0; i < count; i += 1) {
-    const r = radius * (0.4 + Math.random() * 0.6);
-    const theta = Math.random() * Math.PI * 2;
-    const phi = Math.acos(1 - 2 * Math.random());
-    const idx = i * 3;
-    positions[idx] = r * Math.sin(phi) * Math.cos(theta);
-    positions[idx + 1] = r * Math.cos(phi);
-    positions[idx + 2] = r * Math.sin(phi) * Math.sin(theta);
-  }
-  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-
-  const points = new THREE.Points(
-    geometry,
-    new THREE.PointsMaterial({
-      color,
-      size,
-      sizeAttenuation: true,
-      transparent: true,
-      opacity: 0.9,
-    }),
-  );
-  return points;
-}
-
 function createEarthScale() {
   const group = new THREE.Group();
-  const earthRadius = EARTH_RADIUS;
-  const earthGeometry = new THREE.CircleGeometry(earthRadius, 96);
-  const earthMaterial = new THREE.MeshStandardMaterial({
-    color: 0x3f8f3f,
-    roughness: 0.9,
-    metalness: 0.0,
-  });
-  const earth = new THREE.Mesh(earthGeometry, earthMaterial);
+
+  const earth = new THREE.Mesh(
+    new THREE.CircleGeometry(EARTH_RADIUS, 256),
+    new THREE.MeshLambertMaterial({
+      map: createEarthTexture(),
+    }),
+  );
   earth.rotation.x = -Math.PI / 2;
   earth.position.y = -0.14;
+  earth.name = "earth-surface";
   group.add(earth);
+
+  group.add(createCloudLayer());
+  group.add(createAtmosphereRing());
 
   return group;
 }
@@ -486,13 +840,33 @@ function createPlanetaryScale() {
   const sunCenter = new THREE.Vector2(-780_000, anchorZ - 80_000);
 
   const innerPlanets = [
-    // Keep each planet at same orbit radius, but move to new angles.
-    { radiusKm: 2_440, color: 0xff2e2e, x: -38_000, z: anchorZ - 1_500, orbitAngle: 2.55 }, // Mercury red
-    { radiusKm: 6_052, color: 0xff8e1a, x: -24_000, z: anchorZ + 900, orbitAngle: 2.0 },    // Venus orange
-    { radiusKm: 3_390, color: 0xffdb3a, x: 24_000, z: anchorZ - 1_100, orbitAngle: 0.65 },   // Mars yellow
+    {
+      radiusKm: 2_440,
+      color: 0xff2e2e,
+      x: -38_000,
+      z: anchorZ - 1_500,
+      orbitAngle: 2.55,
+    },
+    {
+      radiusKm: 6_052,
+      color: 0xff8e1a,
+      x: -24_000,
+      z: anchorZ + 900,
+      orbitAngle: 2.0,
+    },
+    {
+      radiusKm: 3_390,
+      color: 0xffdb3a,
+      x: 24_000,
+      z: anchorZ - 1_100,
+      orbitAngle: 0.65,
+    },
   ];
   for (const planet of innerPlanets) {
-    const radiusFromSun = Math.hypot(planet.x - sunCenter.x, planet.z - sunCenter.y);
+    const radiusFromSun = Math.hypot(
+      planet.x - sunCenter.x,
+      planet.z - sunCenter.y,
+    );
     const x = sunCenter.x + Math.cos(planet.orbitAngle) * radiusFromSun;
     const z = sunCenter.y + Math.sin(planet.orbitAngle) * radiusFromSun;
     const mesh = new THREE.Mesh(
@@ -503,15 +877,41 @@ function createPlanetaryScale() {
     group.add(mesh);
   }
 
-  // Outer planets are present in the same scene from the start, farther right.
   const outerPlanets = [
-    { radiusKm: 69_911, color: 0x31c94e, x: 140_000, z: anchorZ + 6_000, orbitAngle: 1.1 },  // Jupiter green
-    { radiusKm: 58_232, color: 0x3d72ff, x: 400_000, z: anchorZ - 6_000, orbitAngle: 0.38 }, // Saturn blue
-    { radiusKm: 25_362, color: 0x8e44ff, x: 620_000, z: anchorZ + 5_000, orbitAngle: -0.55 }, // Uranus purple
-    { radiusKm: 24_622, color: 0xff5fb5, x: 730_000, z: anchorZ - 7_000, orbitAngle: -1.12 }, // Neptune pink
+    {
+      radiusKm: 69_911,
+      color: 0x31c94e,
+      x: 140_000,
+      z: anchorZ + 6_000,
+      orbitAngle: 1.1,
+    },
+    {
+      radiusKm: 58_232,
+      color: 0x3d72ff,
+      x: 400_000,
+      z: anchorZ - 6_000,
+      orbitAngle: 0.38,
+    },
+    {
+      radiusKm: 25_362,
+      color: 0x8e44ff,
+      x: 620_000,
+      z: anchorZ + 5_000,
+      orbitAngle: -0.55,
+    },
+    {
+      radiusKm: 24_622,
+      color: 0xff5fb5,
+      x: 730_000,
+      z: anchorZ - 7_000,
+      orbitAngle: -1.12,
+    },
   ];
   for (const planet of outerPlanets) {
-    const radiusFromSun = Math.hypot(planet.x - sunCenter.x, planet.z - sunCenter.y);
+    const radiusFromSun = Math.hypot(
+      planet.x - sunCenter.x,
+      planet.z - sunCenter.y,
+    );
     const x = sunCenter.x + Math.cos(planet.orbitAngle) * radiusFromSun;
     const z = sunCenter.y + Math.sin(planet.orbitAngle) * radiusFromSun;
     const mesh = new THREE.Mesh(
@@ -521,10 +921,13 @@ function createPlanetaryScale() {
     mesh.position.set(x, 0, z);
     group.add(mesh);
 
-    // Add ring to Saturn for visual identity.
     if (planet.radiusKm === 58_232) {
       const ring = new THREE.Mesh(
-        new THREE.RingGeometry(planet.radiusKm * kmToWorld * 1.25, planet.radiusKm * kmToWorld * 1.9, 64),
+        new THREE.RingGeometry(
+          planet.radiusKm * kmToWorld * 1.25,
+          planet.radiusKm * kmToWorld * 1.9,
+          64,
+        ),
         new THREE.MeshBasicMaterial({
           color: 0xd8d2bf,
           side: THREE.DoubleSide,
@@ -532,19 +935,17 @@ function createPlanetaryScale() {
           opacity: 0.8,
         }),
       );
-      // Start flat to camera, then tilt with left side dipping toward Jupiter.
       ring.rotation.set(-Math.PI / 2 + 0.26, 0.0, 0.36);
       ring.position.copy(mesh.position);
       group.add(ring);
     }
   }
 
-  // Sun stays left and off center so it does not block Earth.
+  // Flat sun disk reads cleaner than a sphere in top-down composition.
   const sun = new THREE.Mesh(
     new THREE.CircleGeometry(696_700 * kmToWorld, 64),
     new THREE.MeshBasicMaterial({ color: 0xffc06b }),
   );
-  // Flat disk reads cleaner in top-down composition.
   sun.rotation.x = -Math.PI / 2;
   sun.position.set(-780_000, 0, anchorZ - 80_000);
   group.add(sun);
@@ -552,15 +953,8 @@ function createPlanetaryScale() {
   return group;
 }
 
-function createSolarScale() {
-  const group = new THREE.Group();
-
-  return group;
-}
-
 function createKuiperBeltScale() {
   const group = new THREE.Group();
-  // Match the Sun center in x/z so the belt is truly sun-centered.
   const center = new THREE.Vector3(-780_000, -1_200_000, 0);
   const count = 32000;
   const positions = new Float32Array(count * 3);
@@ -574,10 +968,12 @@ function createKuiperBeltScale() {
     positions[idx + 1] = center.y + (Math.random() - 0.5) * 40_000;
     positions[idx + 2] = center.z + Math.sin(angle) * radius;
 
-    const color = new THREE.Color(rockPalette[Math.floor(Math.random() * rockPalette.length)]);
-    colors[idx] = color.r;
-    colors[idx + 1] = color.g;
-    colors[idx + 2] = color.b;
+    const c = new THREE.Color(
+      rockPalette[Math.floor(Math.random() * rockPalette.length)],
+    );
+    colors[idx] = c.r;
+    colors[idx + 1] = c.g;
+    colors[idx + 2] = c.b;
   }
   const geom = new THREE.BufferGeometry();
   geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
@@ -587,8 +983,12 @@ function createKuiperBeltScale() {
       geom,
       new THREE.PointsMaterial({
         vertexColors: true,
-        size: 62,
-        sizeAttenuation: true,
+        // Constant-pixel sizing so Kuiper rocks remain visible across the
+        // 5+ orders of magnitude in camera distance the layer spans. With
+        // sizeAttenuation: true the original 62-world-unit size projected
+        // to ~1e-6 px at the layer's intended camera height.
+        size: 2.5,
+        sizeAttenuation: false,
         transparent: true,
         opacity: 0.92,
       }),
@@ -620,10 +1020,10 @@ function createOortCloudScale() {
       geom,
       new THREE.PointsMaterial({
         color: 0xd8ecff,
-        size: 42,
-        sizeAttenuation: true,
+        size: 1.8,
+        sizeAttenuation: false,
         transparent: true,
-        opacity: 0.5,
+        opacity: 0.55,
       }),
     ),
   );
@@ -632,8 +1032,11 @@ function createOortCloudScale() {
 
 function createGalacticScale() {
   const group = new THREE.Group();
-  // Huge, high-in-frame galaxy: appears above Oort cloud in screen space.
-  const galacticCenter = new THREE.Vector3(55_000_000, -120_000_000, -3_600_000_000);
+  const galacticCenter = new THREE.Vector3(
+    55_000_000,
+    -120_000_000,
+    -3_600_000_000,
+  );
   const galaxyRadius = 12_000_000_000;
   const coreRadius = 2_200_000_000;
   const armCount = 5;
@@ -653,10 +1056,16 @@ function createGalacticScale() {
     const armOffset = (arm / armCount) * Math.PI * 2;
     for (let i = 0; i < starsPerArm; i += 1) {
       const t = i / starsPerArm;
-      const radius = coreRadius + t * (galaxyRadius - coreRadius) + (Math.random() - 0.5) * 90_000_000;
+      const radius =
+        coreRadius +
+        t * (galaxyRadius - coreRadius) +
+        (Math.random() - 0.5) * 90_000_000;
       const angle = armOffset + t * 10.0 + (Math.random() - 0.5) * 0.28;
       armPositions[armCursor] = galacticCenter.x + Math.cos(angle) * radius;
-      armPositions[armCursor + 1] = galacticCenter.y + denseLayerY + (Math.random() - 0.5) * (460_000_000 + radius * 0.05);
+      armPositions[armCursor + 1] =
+        galacticCenter.y +
+        denseLayerY +
+        (Math.random() - 0.5) * (460_000_000 + radius * 0.05);
       armPositions[armCursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
 
       const warmth = 0.3 + Math.random() * 0.7;
@@ -666,7 +1075,6 @@ function createGalacticScale() {
       armCursor += 3;
     }
   }
-
   const armGeom = new THREE.BufferGeometry();
   armGeom.setAttribute("position", new THREE.BufferAttribute(armPositions, 3));
   armGeom.setAttribute("color", new THREE.BufferAttribute(armColors, 3));
@@ -674,19 +1082,22 @@ function createGalacticScale() {
     new THREE.Points(
       armGeom,
       new THREE.PointsMaterial({
-        size: 2_000_000,
-        sizeAttenuation: true,
+        // Stars render at constant pixel size so the spiral pattern is
+        // visible across the entire Milky Way zoom range. With attenuation
+        // on, the previous 2M-world-unit size projected to ~4e-9 px at the
+        // layer's intended camera distance.
+        size: 2.2,
+        sizeAttenuation: false,
         map: roundSprite,
         alphaMap: roundSprite,
         alphaTest: 0.15,
         vertexColors: true,
         transparent: true,
-        opacity: 0.88,
+        opacity: 0.92,
       }),
     ),
   );
 
-  // Sparse early bodies: visible shortly after Oort.
   const haloPositions = new Float32Array(haloCount * 3);
   const haloColors = new Float32Array(haloCount * 3);
   let haloCursor = 0;
@@ -696,34 +1107,37 @@ function createGalacticScale() {
     const angle = Math.random() * Math.PI * 2;
     haloPositions[haloCursor] = galacticCenter.x + Math.cos(angle) * radius;
     haloPositions[haloCursor + 1] =
-      galacticCenter.y + sparseLayerY + (Math.random() - 0.5) * (380_000_000 + radius * 0.04);
+      galacticCenter.y +
+      sparseLayerY +
+      (Math.random() - 0.5) * (380_000_000 + radius * 0.04);
     haloPositions[haloCursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
     haloColors[haloCursor] = 0.55 + Math.random() * 0.2;
     haloColors[haloCursor + 1] = 0.6 + Math.random() * 0.2;
     haloColors[haloCursor + 2] = 0.72 + Math.random() * 0.2;
     haloCursor += 3;
   }
-
   const haloGeom = new THREE.BufferGeometry();
-  haloGeom.setAttribute("position", new THREE.BufferAttribute(haloPositions, 3));
+  haloGeom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(haloPositions, 3),
+  );
   haloGeom.setAttribute("color", new THREE.BufferAttribute(haloColors, 3));
   group.add(
     new THREE.Points(
       haloGeom,
       new THREE.PointsMaterial({
-        size: 1_600_000,
-        sizeAttenuation: true,
+        size: 1.6,
+        sizeAttenuation: false,
         map: roundSprite,
         alphaMap: roundSprite,
         alphaTest: 0.15,
         vertexColors: true,
         transparent: true,
-        opacity: 0.24,
+        opacity: 0.55,
       }),
     ),
   );
 
-  // Mid-density arm points appear after the sparse halo and before dense spiral.
   const midCount = Math.floor((armCount * starsPerArm) / 3);
   const midPositions = new Float32Array(midCount * 3);
   const midColors = new Float32Array(midCount * 3);
@@ -735,7 +1149,10 @@ function createGalacticScale() {
     const armOffset = (arm / armCount) * Math.PI * 2;
     const angle = armOffset + t * 10.0 + (Math.random() - 0.5) * 0.24;
     midPositions[midCursor] = galacticCenter.x + Math.cos(angle) * radius;
-    midPositions[midCursor + 1] = galacticCenter.y + midLayerY + (Math.random() - 0.5) * (320_000_000 + radius * 0.03);
+    midPositions[midCursor + 1] =
+      galacticCenter.y +
+      midLayerY +
+      (Math.random() - 0.5) * (320_000_000 + radius * 0.03);
     midPositions[midCursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
     const c = 0.72 + Math.random() * 0.22;
     midColors[midCursor] = c;
@@ -750,82 +1167,68 @@ function createGalacticScale() {
     new THREE.Points(
       midGeom,
       new THREE.PointsMaterial({
-        size: 1_800_000,
-        sizeAttenuation: true,
+        size: 1.9,
+        sizeAttenuation: false,
         map: roundSprite,
         alphaMap: roundSprite,
         alphaTest: 0.15,
         vertexColors: true,
         transparent: true,
-        opacity: 0.46,
+        opacity: 0.7,
       }),
     ),
   );
 
-  // Purple tint across the full Milky Way with stronger top-layer emphasis.
-  const hazeDisk = new THREE.Mesh(
-    new THREE.CircleGeometry(galaxyRadius * 0.98, 120),
-    new THREE.MeshBasicMaterial({
-      color: 0xb58cff,
-      transparent: true,
-      opacity: 0.001,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
-    }),
+  // 420 bright bodies are batched into a single InstancedMesh so the dense
+  // spiral reads at one draw call instead of 420.
+  const brightBodies = new THREE.InstancedMesh(
+    new THREE.SphereGeometry(1, 10, 8),
+    new THREE.MeshLambertMaterial(),
+    brightBodyCount,
   );
-  hazeDisk.name = "milky-haze-base";
-  hazeDisk.rotation.x = -Math.PI / 2;
-  hazeDisk.position.set(galacticCenter.x, galacticCenter.y + sparseLayerY, galacticCenter.z);
-  group.add(hazeDisk);
-
-  const hazeTop = new THREE.Mesh(
-    new THREE.CircleGeometry(galaxyRadius * 0.86, 120),
-    new THREE.MeshBasicMaterial({
-      color: 0xc7a3ff,
-      transparent: true,
-      opacity: 0.001,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
-    }),
-  );
-  hazeTop.name = "milky-haze-top";
-  hazeTop.rotation.x = -Math.PI / 2;
-  hazeTop.position.set(galacticCenter.x, galacticCenter.y + denseLayerY, galacticCenter.z);
-  group.add(hazeTop);
-
+  const dummy = new THREE.Object3D();
+  const bodyColor = new THREE.Color();
   for (let i = 0; i < brightBodyCount; i += 1) {
     const t = Math.pow(Math.random(), 1.35);
     const radius = coreRadius + t * (galaxyRadius * 0.94 - coreRadius);
     const arm = Math.floor(Math.random() * armCount);
     const armOffset = (arm / armCount) * Math.PI * 2;
     const angle = armOffset + t * 10.0 + (Math.random() - 0.5) * 0.2;
-    const body = new THREE.Mesh(
-      new THREE.SphereGeometry(4_000_000 + Math.random() * 4_000_000, 10, 8),
-      new THREE.MeshStandardMaterial({
-        color: new THREE.Color().setHSL(
-          0.02 + Math.random() * 0.62,
-          0.42 + Math.random() * 0.38,
-          0.54 + Math.random() * 0.26,
-        ),
-        roughness: 0.82,
-      }),
-    );
-    body.position.set(
+    const r = 4_000_000 + Math.random() * 4_000_000;
+    dummy.position.set(
       galacticCenter.x + Math.cos(angle) * radius,
-      galacticCenter.y + denseLayerY + (Math.random() - 0.5) * (420_000_000 + radius * 0.04),
+      galacticCenter.y +
+        denseLayerY +
+        (Math.random() - 0.5) * (420_000_000 + radius * 0.04),
       galacticCenter.z + Math.sin(angle) * radius,
     );
-    group.add(body);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.setScalar(r);
+    dummy.updateMatrix();
+    brightBodies.setMatrixAt(i, dummy.matrix);
+    bodyColor.setHSL(
+      0.02 + Math.random() * 0.62,
+      0.42 + Math.random() * 0.38,
+      0.54 + Math.random() * 0.26,
+    );
+    brightBodies.setColorAt(i, bodyColor);
   }
+  brightBodies.instanceMatrix.needsUpdate = true;
+  if (brightBodies.instanceColor) {
+    brightBodies.instanceColor.needsUpdate = true;
+  }
+  group.add(brightBodies);
 
-  // Massive black hole at center, intentionally larger than Oort cloud.
+  // Massive black hole at the galactic center.
   const blackHole = new THREE.Mesh(
     new THREE.SphereGeometry(70_000_000, 36, 24),
     new THREE.MeshBasicMaterial({ color: 0x030303 }),
   );
-  blackHole.position.set(galacticCenter.x, galacticCenter.y + denseLayerY, galacticCenter.z);
+  blackHole.position.set(
+    galacticCenter.x,
+    galacticCenter.y + denseLayerY,
+    galacticCenter.z,
+  );
   group.add(blackHole);
 
   return group;
@@ -833,151 +1236,202 @@ function createGalacticScale() {
 
 function createCosmicScale() {
   const group = new THREE.Group();
-  const cosmicCenter = new THREE.Vector3(-780_000, -60_000_000, -80_000);
-
+  const center = new THREE.Vector3(55_000_000, -200_000_000, -3_600_000_000);
+  const count = 6500;
+  const positions = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  const scaleSize = 60_000_000_000;
+  const sprite = createRoundSpriteTexture();
+  for (let i = 0; i < count; i += 1) {
+    const idx = i * 3;
+    positions[idx] = center.x + (Math.random() - 0.5) * scaleSize;
+    positions[idx + 1] = center.y + (Math.random() - 0.5) * scaleSize * 0.5;
+    positions[idx + 2] = center.z + (Math.random() - 0.5) * scaleSize;
+    const t = Math.random();
+    colors[idx] = 0.7 + t * 0.3;
+    colors[idx + 1] = 0.6 + t * 0.3;
+    colors[idx + 2] = 0.85 + (1 - t) * 0.15;
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  group.add(
+    new THREE.Points(
+      geom,
+      new THREE.PointsMaterial({
+        size: 2.6,
+        sizeAttenuation: false,
+        map: sprite,
+        alphaMap: sprite,
+        alphaTest: 0.1,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.92,
+      }),
+    ),
+  );
   return group;
 }
 
-function smoothStep(edge0, edge1, x) {
-  const t = THREE.MathUtils.clamp((x - edge0) / (edge1 - edge0), 0, 1);
-  return t * t * (3 - 2 * t);
-}
+// ============================================================================
+// Scene composition
+// ============================================================================
 
-function setObjectOpacity(object, alpha) {
-  object.visible = alpha > 0.002;
-  object.traverse((child) => {
-    if (!child.material) {
-      return;
-    }
-    const materials = Array.isArray(child.material) ? child.material : [child.material];
-    for (const material of materials) {
-      if (material.userData.baseOpacity === undefined) {
-        material.userData.baseOpacity = material.opacity ?? 1;
-      }
-      material.opacity = material.userData.baseOpacity * alpha;
-      const shouldTransparent = alpha < 0.999;
-      material.transparent = shouldTransparent;
-      material.depthWrite = alpha > 0.98;
-      if (material.userData.wasTransparent !== shouldTransparent) {
-        material.needsUpdate = true;
-        material.userData.wasTransparent = shouldTransparent;
-      }
-    }
-  });
-}
+function setupScene() {
+  // Every factory is added directly to the scene at full opacity. There is
+  // no layer-fade orchestration, no per-frame opacity updates, and no name
+  // map — once setupScene returns, the scene graph is complete.
+  scene.add(createPicnicScale());
+  scene.add(createParkScale());
+  scene.add(createNeighborhoodScale());
+  scene.add(createCityScale());
 
-function updateMilkyWayHaze() {
-  const milkyWay = scaleObjects.get("Milky Way");
-  if (!milkyWay) {
-    return;
-  }
-  const baseHaze = milkyWay.getObjectByName("milky-haze-base");
-  const topHaze = milkyWay.getObjectByName("milky-haze-top");
-  if (!baseHaze || !topHaze || !baseHaze.material || !topHaze.material) {
-    return;
-  }
-  // Start right after Oort begins to read in space.
-  const start = 12.0;
-  const end = 22.2;
-  const t = THREE.MathUtils.clamp((exponent - start) / (end - start), 0, 1);
-  const baseOpacity = THREE.MathUtils.lerp(0.01, 0.12, t);
-  const topOpacity = THREE.MathUtils.lerp(0.004, 0.22, t * t);
+  const earth = createEarthScale();
+  scene.add(earth);
+  // Cache the cloud disk so animate() can spin it without re-traversing.
+  cloudDisk = earth.getObjectByName("earth-clouds-disk");
 
-  const baseMaterial = baseHaze.material;
-  baseMaterial.opacity = baseOpacity;
-  baseMaterial.transparent = true;
-  baseMaterial.depthWrite = false;
-
-  const topMaterial = topHaze.material;
-  topMaterial.opacity = topOpacity;
-  topMaterial.transparent = true;
-  topMaterial.depthWrite = false;
-}
-
-const scaleDefinitions = [
-  { name: "Picnic Blanket", min: -2, max: 0.6, blend: 0.42, factory: createPicnicScale },
-  { name: "Park and Trees", min: 0.25, max: 2.2, blend: 0.52, factory: createParkScale },
-  { name: "Neighborhood", min: 1.5, max: 4.1, blend: 0.52, factory: createNeighborhoodScale },
-  { name: "Cityscape", min: 3.2, max: 5.9, blend: 0.56, factory: createCityScale },
-  // Earth is the permanent base layer in the stack.
-  { name: "Earth", min: -2, max: 24, blend: 0.2, factory: createEarthScale },
-  { name: "Near Space", min: 5.8, max: 10.5, blend: 0.8, factory: createPlanetaryScale },
-  { name: "Solar System", min: 8.6, max: 14, blend: 0.6, factory: createSolarScale },
-  { name: "Kuiper Belt", min: 10.5, max: 16, blend: 0.6, factory: createKuiperBeltScale },
-  { name: "Oort Cloud", min: 12, max: 18, blend: 0.6, factory: createOortCloudScale },
-  { name: "Milky Way", min: 17.4, max: 22.2, blend: 1.8, factory: createGalacticScale },
-  { name: "Cosmic Web", min: 22.2, max: 24, blend: 0.6, factory: createCosmicScale },
-];
-
-function initializeScales() {
-  for (const def of scaleDefinitions) {
-    const object = def.factory();
-    object.name = def.name;
-    world.add(object);
-    scaleObjects.set(def.name, object);
-    setObjectOpacity(object, 0);
-  }
-}
-
-function updateRanges() {
-  for (const def of scaleDefinitions) {
-    const object = scaleObjects.get(def.name);
-    if (!object) {
-      continue;
-    }
-    const alpha = ALWAYS_ON_LAYERS.has(def.name)
-      ? 1
-      : smoothStep(def.min - def.blend, def.min + def.blend, exponent);
-    setObjectOpacity(object, alpha);
-  }
-  updateMilkyWayHaze();
+  scene.add(createPlanetaryScale());
+  scene.add(createKuiperBeltScale());
+  scene.add(createOortCloudScale());
+  scene.add(createGalacticScale());
+  scene.add(createCosmicScale());
 }
 
 function updateCamera() {
   const distanceMeters = 10 ** exponent;
   const distanceWorld = distanceMeters / metersPerWorldUnit;
   camera.position.set(0, distanceWorld, 0);
-  camera.lookAt(tmpVec.set(0, 0, 0));
+  camera.lookAt(0, 0, 0);
 
-  const smoothFar = Math.max(10_000, distanceWorld * 5);
-  camera.far = smoothFar;
-  camera.near = Math.max(0.01, distanceWorld / 50_000);
+  // Keep everything in frustum: farthest point is at most ~distanceWorld + SCENE_RADIUS
+  // along the top-down ray (plus diagonal slack). Old `5 * distanceWorld` clipped
+  // Kuiper / Oort / galaxy until the camera crossed an exponent threshold.
+  camera.near = Math.max(1e-5, distanceWorld / 200_000);
+  camera.far = Math.max(
+    100_000,
+    distanceWorld + SCENE_RADIUS * 2.5,
+    SCENE_RADIUS * 2.5,
+  );
   camera.updateProjectionMatrix();
 
-  const activeName =
-    scaleDefinitions.find((range) => exponent >= range.min && exponent < range.max)?.name ??
-    "Transition";
-  scaleLabel.textContent = `${activeName} | 10^${exponent.toFixed(2)} m`;
-}
-
-const clock = new THREE.Clock();
-function animate() {
-  requestAnimationFrame(animate);
-  const dt = clock.getDelta();
-
-  if (!paused) {
-    exponent += speed * dt;
-    exponent = THREE.MathUtils.clamp(exponent, minExponent, maxExponent);
-    if (exponent === maxExponent) {
-      paused = true;
-    }
+  if (scaleLabel) {
+    scaleLabel.textContent = `10^${exponent.toFixed(2)} m`;
   }
 
-  updateRanges();
+  if (statusLabel) {
+    if (overviewTour) {
+      const leg = overviewTour.phase === "out" ? "Zoom out" : "Return";
+      statusLabel.textContent = `${leg} (tour) | ${speed.toFixed(2)}x`;
+    } else if (paused) {
+      statusLabel.textContent = "Paused";
+    } else {
+      const dirText = direction > 0 ? "Outward" : "Inward";
+      statusLabel.textContent = `${speed.toFixed(2)}x | ${dirText}`;
+    }
+  }
+}
+
+// ============================================================================
+// Animation loop + input
+// ============================================================================
+
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  // Clamp dt so a backgrounded tab does not produce a single huge step
+  // when the user returns and the clock has accumulated wall time.
+  const dt = Math.min(clock.getDelta(), 0.1);
+
+  if (overviewTour) {
+    overviewTour.elapsed += dt;
+    const rawT = Math.min(1, overviewTour.elapsed / overviewTour.duration);
+    const k = smoothT(rawT);
+    exponent = THREE.MathUtils.lerp(overviewTour.from, overviewTour.to, k);
+
+    if (rawT >= 1) {
+      exponent = overviewTour.to;
+      if (overviewTour.phase === "out") {
+        overviewTour = {
+          phase: "in",
+          elapsed: 0,
+          duration: OVERVIEW_TOUR_IN_SECONDS,
+          from: OVERVIEW_EXPONENT,
+          to: TOUR_RETURN_EXPONENT,
+        };
+      } else {
+        overviewTour = null;
+        exponent = TOUR_RETURN_EXPONENT;
+        paused = true;
+      }
+    }
+  } else if (!paused) {
+    exponent += direction * speed * dt;
+    exponent = THREE.MathUtils.clamp(exponent, minExponent, maxExponent);
+  }
+
+  if (cloudDisk) {
+    cloudDisk.rotation.z += dt * 0.02;
+  }
+
   updateCamera();
 
   renderer.render(scene, camera);
 }
 
 window.addEventListener("keydown", (event) => {
-  if (event.code === "Space") {
+  if (event.code === "Enter") {
+    overviewTour = {
+      phase: "out",
+      elapsed: 0,
+      duration: OVERVIEW_TOUR_OUT_SECONDS,
+      from: exponent,
+      to: OVERVIEW_EXPONENT,
+    };
+    event.preventDefault();
+  } else if (event.code === "Space") {
+    if (overviewTour) {
+      event.preventDefault();
+      return;
+    }
     paused = !paused;
-  }
-  if (event.code === "ArrowUp") {
+    event.preventDefault();
+  } else if (event.code === "ArrowUp") {
+    if (overviewTour) {
+      event.preventDefault();
+      return;
+    }
     speed = Math.min(1.2, speed + 0.05);
-  }
-  if (event.code === "ArrowDown") {
+    event.preventDefault();
+  } else if (event.code === "ArrowDown") {
+    if (overviewTour) {
+      event.preventDefault();
+      return;
+    }
     speed = Math.max(0.05, speed - 0.05);
+    event.preventDefault();
+  } else if (event.code === "KeyR") {
+    if (overviewTour) {
+      event.preventDefault();
+      return;
+    }
+    direction *= -1;
+    event.preventDefault();
+  } else if (event.code === "Home") {
+    if (overviewTour) {
+      event.preventDefault();
+      return;
+    }
+    exponent = minExponent;
+    event.preventDefault();
+  } else if (event.code === "End") {
+    if (overviewTour) {
+      event.preventDefault();
+      return;
+    }
+    exponent = maxExponent;
+    event.preventDefault();
   }
 });
 
@@ -985,10 +1439,15 @@ window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 });
 
-initializeScales();
-updateRanges();
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    // Reset the clock so the first dt after returning to the tab is small.
+    clock.start();
+  }
+});
+
+setupScene();
 updateCamera();
 animate();
