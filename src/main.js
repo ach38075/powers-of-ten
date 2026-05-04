@@ -12,12 +12,16 @@ const statusLabel = document.querySelector("#status");
 const renderer = new THREE.WebGLRenderer({
   canvas,
   antialias: true,
-  // Allows sane depth precision when near~10^-4 and far~10^23+ in the same frame.
   logarithmicDepthBuffer: true,
+  powerPreference: "high-performance",
 });
+
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
 const maxAniso = renderer.capabilities.getMaxAnisotropy();
 
 const scene = new THREE.Scene();
@@ -46,42 +50,58 @@ scene.add(sunLight);
 let cloudDisk = null;
 /** Populated by createSunWithGlowGroup — limb shader time uniform */
 let sunGlowTimeUniform = null;
+/** Earth surface mesh when using realistic shaders — used to refresh globe uniforms. */
+let earthSurfaceMesh = null;
+
+const _earthCenterScratch = new THREE.Vector3();
 
 const metersPerWorldUnit = 1;
 const EARTH_RADIUS = 6700;
+
+// Orthographic globe mapping: sphere center lies R below the north pole on the disk.
+// Disk plane is y = -0.14 (earth surface mesh position); picnic stays at origin on that disk.
+const EARTH_DISK_Y = -0.14;
+const EARTH_SPHERE_CENTER = new THREE.Vector3(
+  0,
+  EARTH_DISK_Y - EARTH_RADIUS,
+  0,
+);
+
+// Rotate globe sampling so the disk center (picnic at world origin) sits over
+// Athens, Georgia, USA — Piedmont forest / green land on the day map, not ocean.
+// (Must match real lat/lon; 30°N / −75°W is open ocean — easy to mistake for “wrong shader”.)
+function createGlobeTextureQuaternion() {
+  const lat = THREE.MathUtils.degToRad(33.85);
+  const lon = THREE.MathUtils.degToRad(-93.36);
+  const target = new THREE.Vector3(
+    Math.cos(lat) * Math.cos(lon),
+    Math.sin(lat),
+    Math.cos(lat) * Math.sin(lon),
+  ).normalize();
+  return new THREE.Quaternion().setFromUnitVectors(
+    new THREE.Vector3(0, 1, 0),
+    target,
+  );
+}
+
+const GLOBE_TEX_QUAT_ROTATE = `
+vec3 globeQuatRotate(vec4 q, vec3 v) {
+  vec3 t = 2.0 * cross(q.xyz, v);
+  return v + q.w * t + cross(q.xyz, t);
+}
+`;
+
+const EARTH_TEXTURE_URLS = {
+  day: "https://raw.githubusercontent.com/mrdoob/three.js/r184/examples/textures/planets/earth_day_4096.jpg",
+  clouds:
+    "https://raw.githubusercontent.com/mrdoob/three.js/r184/examples/textures/planets/earth_clouds_1024.png",
+};
 
 // Furthest scene content (Cosmic Web, galaxy, Oort) sits within ~this distance of
 // the origin. Camera looks at origin from +Y; without (distanceWorld + margin) in
 // `far`, bodies like the Kuiper belt pop in only once 5*distanceWorld exceeds their
 // depth — the "choppy layer" effect.
-const SCENE_RADIUS =
-  90_000_000_000;
-
-// Shared between createCityScale (towers) and the Earth texture (city lights)
-// so the warm dots visible from space line up with where towers appear up close.
-const CITY_CENTERS = [
-  { x: -1700, z: 1300 },
-  { x: 2200, z: -900 },
-  { x: -500, z: -2300 },
-  { x: 1800, z: 2000 },
-];
-
-// CONTINENTS is the source of truth for land. The Earth texture renders shorelines
-// from these via noise; LAND_REGIONS is the bounding-circle fallback used by simpler
-// placement helpers (isLandAt / projectToLand) to keep house and city placement cheap.
-const CONTINENTS = [
-  { x: 200, z: -100, r: 1700, seed: 5.5, biomeBias: 0.3 },
-  { x: -1800, z: -900, r: 1900, seed: 11.7, biomeBias: 0.4 },
-  { x: 1400, z: -1100, r: 1600, seed: 27.3, biomeBias: 0.55 },
-  { x: -500, z: 1800, r: 1500, seed: 41.9, biomeBias: 0.45 },
-  { x: 2200, z: 1500, r: 1200, seed: 58.6, biomeBias: 0.65 },
-  { x: -2600, z: 1500, r: 1100, seed: 73.2, biomeBias: 0.5 },
-  { x: 3200, z: -900, r: 1000, seed: 89.4, biomeBias: 0.7 },
-  { x: -3300, z: -1400, r: 900, seed: 102.8, biomeBias: 0.55 },
-  { x: 2700, z: 2700, r: 850, seed: 118.1, biomeBias: 0.6 },
-  { x: -800, z: -3100, r: 950, seed: 131.5, biomeBias: 0.45 },
-];
-const LAND_REGIONS = CONTINENTS.map(({ x, z, r }) => ({ x, z, r }));
+const SCENE_RADIUS = 90_000_000_000;
 
 const minExponent = -1.7;
 const maxExponent = 23;
@@ -114,48 +134,156 @@ let paused = false;
  */
 let overviewTour = null;
 
-// ============================================================================
-// Inline 2D value noise (zero deps)
-// ============================================================================
-
-function hash2(ix, iy) {
-  const h = Math.sin(ix * 127.1 + iy * 311.7) * 43758.5453;
-  return h - Math.floor(h);
-}
-
 function smoothT(t) {
   return t * t * (3 - 2 * t);
-}
-
-function valueNoise2D(x, y) {
-  const ix = Math.floor(x);
-  const iy = Math.floor(y);
-  const fx = x - ix;
-  const fy = y - iy;
-  const a = hash2(ix, iy);
-  const b = hash2(ix + 1, iy);
-  const c = hash2(ix, iy + 1);
-  const d = hash2(ix + 1, iy + 1);
-  const u = smoothT(fx);
-  const v = smoothT(fy);
-  return a * (1 - u) * (1 - v) + b * u * (1 - v) + c * (1 - u) * v + d * u * v;
-}
-
-function fbm2D(x, y, octaves = 4) {
-  let amp = 0.5;
-  let freq = 1;
-  let sum = 0;
-  for (let i = 0; i < octaves; i += 1) {
-    sum += amp * valueNoise2D(x * freq, y * freq);
-    amp *= 0.5;
-    freq *= 2;
-  }
-  return sum;
 }
 
 // ============================================================================
 // Sprite + procedural texture helpers
 // ============================================================================
+
+function loadEarthTextureSet() {
+  const loader = new THREE.TextureLoader();
+  const loadOne = (url) =>
+    new Promise((resolve, reject) => {
+      loader.load(url, resolve, undefined, reject);
+    });
+  return Promise.all([
+    loadOne(EARTH_TEXTURE_URLS.day),
+    loadOne(EARTH_TEXTURE_URLS.clouds),
+  ]).then(([day, clouds]) => {
+    for (const t of [day, clouds]) {
+      t.anisotropy = maxAniso;
+      t.colorSpace = THREE.SRGBColorSpace;
+    }
+    day.generateMipmaps = true;
+    day.minFilter = THREE.LinearMipmapLinearFilter;
+    clouds.minFilter = THREE.LinearMipmapLinearFilter;
+    day.wrapS = THREE.RepeatWrapping;
+    clouds.wrapS = THREE.RepeatWrapping;
+    return { day, clouds };
+  });
+}
+
+const GLOBE_VERT = `
+#include <common>
+#include <logdepthbuf_pars_vertex>
+
+uniform vec3 uSphereCenter;
+uniform float uRadius;
+varying vec3 vSphereDir;
+
+void main() {
+  vec4 wpos = modelMatrix * vec4(position, 1.0);
+  vec2 horiz = wpos.xz - uSphereCenter.xz;
+  float xz2 = dot(horiz, horiz);
+  float h = sqrt(max(0.0, uRadius * uRadius - xz2));
+  vec3 dir = vec3(horiz.x, h, horiz.y) / uRadius;
+  vSphereDir = dir;
+  gl_Position = projectionMatrix * viewMatrix * wpos;
+  #include <logdepthbuf_vertex>
+}
+`;
+
+function createRealisticEarthMaterial(textures, globeQuat) {
+  const uniforms = {
+    uSphereCenter: { value: EARTH_SPHERE_CENTER.clone() },
+    uRadius: { value: EARTH_RADIUS },
+    uGlobeTexQuat: {
+      value: new THREE.Vector4(
+        globeQuat.x,
+        globeQuat.y,
+        globeQuat.z,
+        globeQuat.w,
+      ),
+    },
+    uDayMap: { value: textures.day },
+  };
+  return new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: GLOBE_VERT,
+    fragmentShader: `
+#include <common>
+#include <logdepthbuf_pars_fragment>
+
+${GLOBE_TEX_QUAT_ROTATE}
+
+uniform sampler2D uDayMap;
+uniform vec4 uGlobeTexQuat;
+varying vec3 vSphereDir;
+
+void main() {
+  vec3 dir = normalize(globeQuatRotate(uGlobeTexQuat, normalize(vSphereDir)));
+  float lambda = atan(dir.z, dir.x);
+  float phi = asin(clamp(dir.y, -1.0, 1.0));
+  // Equirectangular v: +phi is north. WebGL textures often have image north at high v
+  // (Three flipY); use +phi here so the picnic cap matches NASA-style maps.
+  vec2 uv = vec2(
+    fract(lambda * 0.159154943 + 0.5),
+    clamp(0.5 + phi * 0.318309886, 0.001, 0.999)
+  );
+  gl_FragColor = vec4(texture2D(uDayMap, uv).rgb, 1.0);
+  #include <logdepthbuf_fragment>
+}
+    `,
+    lights: false,
+    colorSpace: THREE.SRGBColorSpace,
+    polygonOffset: true,
+    polygonOffsetFactor: 1,
+    polygonOffsetUnits: 1,
+  });
+}
+
+function createRealisticEarthCloudMaterial(
+  cloudTex,
+  sphereCenterUniform,
+  radiusUniform,
+  globeQuatUniform,
+) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uSphereCenter: sphereCenterUniform,
+      uRadius: radiusUniform,
+      uGlobeTexQuat: globeQuatUniform,
+      uCloudMap: { value: cloudTex },
+    },
+    vertexShader: GLOBE_VERT,
+    fragmentShader: `
+#include <common>
+#include <logdepthbuf_pars_fragment>
+
+${GLOBE_TEX_QUAT_ROTATE}
+
+uniform sampler2D uCloudMap;
+uniform vec4 uGlobeTexQuat;
+varying vec3 vSphereDir;
+
+void main() {
+  vec3 dir = normalize(globeQuatRotate(uGlobeTexQuat, normalize(vSphereDir)));
+  float lambda = atan(dir.z, dir.x);
+  float phi = asin(clamp(dir.y, -1.0, 1.0));
+  vec2 uv = vec2(
+    fract(lambda * 0.159154943 + 0.5),
+    clamp(0.5 + phi * 0.318309886, 0.001, 0.999)
+  );
+  vec4 samp = texture2D(uCloudMap, uv);
+  float a = max(samp.a, max(samp.r, max(samp.g, samp.b))) * 0.58;
+  if (a < 0.03) discard;
+  gl_FragColor = vec4(mix(vec3(1.0), samp.rgb, 0.35), a);
+  #include <logdepthbuf_fragment>
+}
+    `,
+    transparent: true,
+    depthWrite: false,
+    depthTest: true,
+    polygonOffset: true,
+    polygonOffsetFactor: -3,
+    polygonOffsetUnits: -4,
+    lights: false,
+  });
+  mat.colorSpace = THREE.SRGBColorSpace;
+  return mat;
+}
 
 /** Wider, softer falloff for star points — reads as glow with additive blending. */
 function createStarGlowSpriteTexture(size = 128) {
@@ -190,213 +318,26 @@ function createStarGlowSpriteTexture(size = 128) {
   return tex;
 }
 
-function createEarthTexture(size = 1536) {
-  const earthCanvas = document.createElement("canvas");
-  earthCanvas.width = size;
-  earthCanvas.height = size;
-  const ctx = earthCanvas.getContext("2d");
-
-  const worldToPx = (w) => ((w / EARTH_RADIUS + 1) / 2) * size;
-  const lengthToPx = (l) => (l / EARTH_RADIUS) * (size / 2);
-
-  // Ocean radial base.
-  const oceanGrad = ctx.createRadialGradient(
-    size / 2,
-    size / 2,
-    0,
-    size / 2,
-    size / 2,
-    size * 0.5,
-  );
-  oceanGrad.addColorStop(0.0, "#143a6b");
-  oceanGrad.addColorStop(0.6, "#0d2c52");
-  oceanGrad.addColorStop(1.0, "#08213e");
-  ctx.fillStyle = oceanGrad;
-  ctx.fillRect(0, 0, size, size);
-
-  // Per-continent shoreline polygon + biome detail + coastline + lakes.
-  for (const continent of CONTINENTS) {
-    const POINTS = 128;
-    const polygon = new Path2D();
-    for (let i = 0; i < POINTS; i += 1) {
-      const angle = (i / POINTS) * Math.PI * 2;
-      const cosA = Math.cos(angle);
-      const sinA = Math.sin(angle);
-      const noise = fbm2D(
-        cosA * 1.6 + continent.seed,
-        sinA * 1.6 + continent.seed,
-        4,
-      );
-      const radius = continent.r * (0.78 + 0.34 * noise);
-      const xPx = worldToPx(continent.x + cosA * radius);
-      const yPx = worldToPx(continent.z + sinA * radius);
-      if (i === 0) {
-        polygon.moveTo(xPx, yPx);
-      } else {
-        polygon.lineTo(xPx, yPx);
-      }
-    }
-    polygon.closePath();
-
-    ctx.fillStyle = "#2c6c3b";
-    ctx.fill(polygon);
-
-    // Biome detail: per-pixel sampling within the continent bounding box, clipped
-    // to the polygon. Bounding box keeps cost proportional to actual land area.
-    ctx.save();
-    ctx.clip(polygon);
-    const bboxR = continent.r * 1.15;
-    const x0 = Math.max(0, Math.floor(worldToPx(continent.x - bboxR)));
-    const y0 = Math.max(0, Math.floor(worldToPx(continent.z - bboxR)));
-    const x1 = Math.min(size, Math.ceil(worldToPx(continent.x + bboxR)));
-    const y1 = Math.min(size, Math.ceil(worldToPx(continent.z + bboxR)));
-    const w = x1 - x0;
-    const h = y1 - y0;
-    if (w > 0 && h > 0) {
-      const img = ctx.getImageData(x0, y0, w, h);
-      const data = img.data;
-      for (let py = 0; py < h; py += 1) {
-        for (let px = 0; px < w; px += 1) {
-          const idx = (py * w + px) * 4;
-          if (data[idx + 3] === 0) {
-            continue;
-          }
-          const wx = (((x0 + px) / size) * 2 - 1) * EARTH_RADIUS;
-          const wy = (((y0 + py) / size) * 2 - 1) * EARTH_RADIUS;
-          const elev = fbm2D(
-            wx * 0.0009 + continent.seed,
-            wy * 0.0009 - continent.seed,
-            4,
-          );
-          const biome = elev + continent.biomeBias * 0.18;
-
-          let r = 44;
-          let g = 108;
-          let b = 59;
-          if (biome > 0.66) {
-            r = 110;
-            g = 98;
-            b = 86;
-          } else if (biome > 0.55) {
-            r = 200;
-            g = 167;
-            b = 106;
-          } else if (biome > 0.42) {
-            r = 111;
-            g = 156;
-            b = 74;
-          }
-
-          const lat = Math.abs(wy) / EARTH_RADIUS;
-          if (lat > 0.78) {
-            const t = Math.min(1, (lat - 0.78) / 0.22);
-            r = Math.round(r * (1 - t) + 232 * t);
-            g = Math.round(g * (1 - t) + 240 * t);
-            b = Math.round(b * (1 - t) + 246 * t);
-          }
-
-          data[idx] = r;
-          data[idx + 1] = g;
-          data[idx + 2] = b;
-        }
-      }
-      ctx.putImageData(img, x0, y0);
-    }
-    ctx.restore();
-
-    ctx.strokeStyle = "rgba(15, 35, 55, 0.55)";
-    ctx.lineWidth = 2;
-    ctx.stroke(polygon);
-
-    if (continent.r >= 1300) {
-      const lakeCount = 1 + Math.floor((continent.r - 1300) / 400);
-      for (let li = 0; li < lakeCount; li += 1) {
-        const lx =
-          continent.x +
-          (fbm2D(continent.seed + li * 7.7, li * 3.1) - 0.5) *
-            continent.r *
-            0.6;
-        const ly =
-          continent.z +
-          (fbm2D(continent.seed + li * 5.3, li * 9.1 + 13) - 0.5) *
-            continent.r *
-            0.6;
-        const lr = 60 + fbm2D(continent.seed + li, li * 2.4) * 110;
-        ctx.beginPath();
-        ctx.arc(worldToPx(lx), worldToPx(ly), lengthToPx(lr), 0, Math.PI * 2);
-        ctx.fillStyle = "#0d2c52";
-        ctx.fill();
-      }
-    }
-  }
-
-  // City lights (warm dots visible from space).
-  for (const cc of CITY_CENTERS) {
-    const cxPx = worldToPx(cc.x);
-    const cyPx = worldToPx(cc.z);
-    const grad = ctx.createRadialGradient(cxPx, cyPx, 0, cxPx, cyPx, 28);
-    grad.addColorStop(0.0, "rgba(255,212,138,0.95)");
-    grad.addColorStop(0.55, "rgba(255,180,90,0.4)");
-    grad.addColorStop(1.0, "rgba(255,180,90,0)");
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(cxPx, cyPx, 28, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  const tex = new THREE.CanvasTexture(earthCanvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = maxAniso;
-  return tex;
-}
-
-function createCloudTexture(size = 512) {
-  const cloudCanvas = document.createElement("canvas");
-  cloudCanvas.width = size;
-  cloudCanvas.height = size;
-  const ctx = cloudCanvas.getContext("2d");
-  const img = ctx.createImageData(size, size);
-  const data = img.data;
-  for (let py = 0; py < size; py += 1) {
-    for (let px = 0; px < size; px += 1) {
-      const idx = (py * size + px) * 4;
-      const dx = px - size / 2;
-      const dy = py - size / 2;
-      const r = Math.hypot(dx, dy) / (size / 2);
-      if (r > 0.99) {
-        data[idx + 3] = 0;
-        continue;
-      }
-      const wx = (px / size) * 8;
-      const wy = (py / size) * 8;
-      const n = fbm2D(wx, wy, 4);
-      const a = Math.max(0, n - 0.55) * 280;
-      data[idx] = 245;
-      data[idx + 1] = 248;
-      data[idx + 2] = 252;
-      data[idx + 3] = Math.min(220, a) * (1 - r * 0.3);
-    }
-  }
-  ctx.putImageData(img, 0, 0);
-  const tex = new THREE.CanvasTexture(cloudCanvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
-}
-
-function createCloudLayer() {
+function createCloudLayer(
+  cloudTex,
+  sphereCenterUniform,
+  radiusUniform,
+  globeQuatUniform,
+) {
   const wrapper = new THREE.Group();
   wrapper.name = "earth-clouds";
   wrapper.rotation.x = -Math.PI / 2;
-  wrapper.position.y = 0.5;
+  // Clear separation from the surface in world Y (reduces z-fighting with log depth).
+  wrapper.position.y = 22;
 
   const disk = new THREE.Mesh(
-    new THREE.CircleGeometry(EARTH_RADIUS * 0.999, 128),
-    new THREE.MeshBasicMaterial({
-      map: createCloudTexture(),
-      transparent: true,
-      depthWrite: false,
-      opacity: 0.7,
-    }),
+    new THREE.CircleGeometry(EARTH_RADIUS * 0.998, 192),
+    createRealisticEarthCloudMaterial(
+      cloudTex,
+      sphereCenterUniform,
+      radiusUniform,
+      globeQuatUniform,
+    ),
   );
   disk.name = "earth-clouds-disk";
   wrapper.add(disk);
@@ -438,35 +379,8 @@ function createAtmosphereRing() {
 }
 
 // ============================================================================
-// Picnic-scale primitives + placement helpers
+// Picnic scale
 // ============================================================================
-
-function makeTree(x, z, trunkHeight = 8, crownRadius = 3.2) {
-  const group = new THREE.Group();
-  const trunk = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.6, 0.8, trunkHeight, 8),
-    new THREE.MeshLambertMaterial({ color: 0x5b3b2b }),
-  );
-  const crown = new THREE.Mesh(
-    new THREE.SphereGeometry(crownRadius, 12, 10),
-    new THREE.MeshLambertMaterial({ color: 0x315b2d }),
-  );
-  trunk.position.y = trunkHeight / 2;
-  crown.position.y = trunkHeight + crownRadius * 0.65;
-  group.position.set(x, 0, z);
-  group.add(trunk);
-  group.add(crown);
-  return group;
-}
-
-function makeBush(x, z, scale = 1) {
-  const bush = new THREE.Mesh(
-    new THREE.SphereGeometry(1.25 * scale, 10, 8),
-    new THREE.MeshLambertMaterial({ color: 0x2f5a2e }),
-  );
-  bush.position.set(x, 1 * scale, z);
-  return bush;
-}
 
 function createLyingPerson(options = {}) {
   const person = new THREE.Group();
@@ -506,178 +420,6 @@ function createLyingPerson(options = {}) {
 
   return person;
 }
-
-function randomPointInRing(innerR, outerR) {
-  const t = Math.random();
-  const radius = Math.sqrt(
-    innerR * innerR + t * (outerR * outerR - innerR * innerR),
-  );
-  const angle = Math.random() * Math.PI * 2;
-  return { x: Math.cos(angle) * radius, z: Math.sin(angle) * radius };
-}
-
-function clampToEarth(x, z, margin = 0) {
-  const limit = EARTH_RADIUS - margin;
-  const length = Math.hypot(x, z);
-  if (length <= limit || length === 0) {
-    return { x, z };
-  }
-  const s = limit / length;
-  return { x: x * s, z: z * s };
-}
-
-function isLandAt(x, z) {
-  return LAND_REGIONS.some(
-    (land) => (x - land.x) ** 2 + (z - land.z) ** 2 < land.r ** 2,
-  );
-}
-
-function projectToLand(x, z) {
-  if (isLandAt(x, z)) {
-    return { x, z };
-  }
-  let best = null;
-  for (const land of LAND_REGIONS) {
-    const dx = x - land.x;
-    const dz = z - land.z;
-    const dist = Math.hypot(dx, dz) || 1;
-    const px = land.x + (dx / dist) * land.r * 0.65;
-    const pz = land.z + (dz / dist) * land.r * 0.65;
-    const delta = (x - px) ** 2 + (z - pz) ** 2;
-    if (!best || delta < best.delta) {
-      best = { x: px, z: pz, delta };
-    }
-  }
-  return best ? { x: best.x, z: best.z } : { x, z };
-}
-
-// ============================================================================
-// Neighborhood (instanced houses)
-// ============================================================================
-
-function addNeighborhoodCluster(group, centerX, centerZ, options = {}) {
-  const anchored = projectToLand(centerX, centerZ);
-  centerX = anchored.x;
-  centerZ = anchored.z;
-  const roads = options.roads ?? 4;
-  const span = options.span ?? 680;
-  const spacing = span / roads;
-  const roadMaterial = new THREE.MeshLambertMaterial({ color: 0x2f2f34 });
-
-  for (let i = -roads + 1; i <= roads - 1; i += 1) {
-    const roadA = new THREE.Mesh(
-      new THREE.PlaneGeometry(span * 2, 34),
-      roadMaterial,
-    );
-    roadA.rotation.x = -Math.PI / 2;
-    roadA.position.set(centerX, 0.012, centerZ + i * spacing);
-    group.add(roadA);
-
-    const roadB = new THREE.Mesh(
-      new THREE.PlaneGeometry(34, span * 2),
-      roadMaterial,
-    );
-    roadB.rotation.x = -Math.PI / 2;
-    roadB.position.set(centerX + i * spacing, 0.012, centerZ);
-    group.add(roadB);
-  }
-
-  // First pass collects house specs; second pass batches into a single
-  // InstancedMesh so the cluster costs one draw call instead of dozens.
-  const occupied = [];
-  const houseSpecs = [];
-  for (let bx = -roads; bx < roads; bx += 1) {
-    for (let bz = -roads; bz < roads; bz += 1) {
-      const blockCenterX = centerX + (bx + 0.5) * spacing;
-      const blockCenterZ = centerZ + (bz + 0.5) * spacing;
-      const houseCount = 3 + Math.floor(Math.random() * 3);
-      for (let h = 0; h < houseCount; h += 1) {
-        let housePos = null;
-        for (let attempt = 0; attempt < 14; attempt += 1) {
-          const candidate = {
-            x: blockCenterX + (Math.random() - 0.5) * (spacing * 0.55),
-            z: blockCenterZ + (Math.random() - 0.5) * (spacing * 0.55),
-          };
-          const tooClose = occupied.some(
-            (p) =>
-              (candidate.x - p.x) ** 2 + (candidate.z - p.z) ** 2 < 34 ** 2,
-          );
-          if (!tooClose) {
-            housePos = candidate;
-            break;
-          }
-        }
-        if (!housePos) {
-          continue;
-        }
-        if (!isLandAt(housePos.x, housePos.z)) {
-          continue;
-        }
-        houseSpecs.push({
-          x: housePos.x,
-          z: housePos.z,
-          w: 18 + Math.random() * 14,
-          h: 12 + Math.random() * 20,
-          d: 16 + Math.random() * 12,
-          rotY: (Math.random() - 0.5) * 1.0,
-          color: new THREE.Color().setHSL(
-            0.03 + Math.random() * 0.08,
-            0.45,
-            0.52 + Math.random() * 0.18,
-          ),
-        });
-        occupied.push(housePos);
-      }
-    }
-  }
-
-  if (houseSpecs.length > 0) {
-    const houses = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(1, 1, 1),
-      new THREE.MeshLambertMaterial(),
-      houseSpecs.length,
-    );
-    const dummy = new THREE.Object3D();
-    for (let i = 0; i < houseSpecs.length; i += 1) {
-      const s = houseSpecs[i];
-      dummy.position.set(s.x, s.h / 2, s.z);
-      dummy.rotation.set(0, s.rotY, 0);
-      dummy.scale.set(s.w, s.h, s.d);
-      dummy.updateMatrix();
-      houses.setMatrixAt(i, dummy.matrix);
-      houses.setColorAt(i, s.color);
-    }
-    houses.instanceMatrix.needsUpdate = true;
-    if (houses.instanceColor) {
-      houses.instanceColor.needsUpdate = true;
-    }
-    group.add(houses);
-  }
-
-  for (const s of houseSpecs) {
-    if (Math.random() < 0.65) {
-      const treeSpot = clampToEarth(
-        s.x + 12 + (Math.random() - 0.5) * 10,
-        s.z + 12 + (Math.random() - 0.5) * 10,
-        40,
-      );
-      if (isLandAt(treeSpot.x, treeSpot.z)) {
-        group.add(
-          makeTree(
-            treeSpot.x,
-            treeSpot.z,
-            5 + Math.random() * 4,
-            2 + Math.random(),
-          ),
-        );
-      }
-    }
-  }
-}
-
-// ============================================================================
-// Scale factories
-// ============================================================================
 
 function createPicnicScale() {
   const group = new THREE.Group();
@@ -747,94 +489,40 @@ function createPicnicScale() {
   return group;
 }
 
-function createParkScale() {
+function createEarthScale(earthMaps) {
   const group = new THREE.Group();
 
-  // Keep the center open for the picnic and reveal trees around it.
-  for (let i = 0; i < 90; i += 1) {
-    const { x, z } = randomPointInRing(45, 360);
-    group.add(makeTree(x, z, 7 + Math.random() * 4, 2.4 + Math.random() * 1.4));
+  if (earthMaps) {
+    const globeQuat = createGlobeTextureQuaternion();
+    const earthMat = createRealisticEarthMaterial(earthMaps, globeQuat);
+    const earth = new THREE.Mesh(
+      new THREE.CircleGeometry(EARTH_RADIUS, 384),
+      earthMat,
+    );
+    earth.rotation.x = -Math.PI / 2;
+    earth.position.y = EARTH_DISK_Y;
+    earth.name = "earth-surface";
+    group.add(earth);
+    group.add(
+      createCloudLayer(
+        earthMaps.clouds,
+        earthMat.uniforms.uSphereCenter,
+        earthMat.uniforms.uRadius,
+        earthMat.uniforms.uGlobeTexQuat,
+      ),
+    );
+  } else {
+    const earth = new THREE.Mesh(
+      new THREE.CircleGeometry(EARTH_RADIUS, 256),
+      new THREE.MeshLambertMaterial({ color: 0x143a6b }),
+    );
+    earth.rotation.x = -Math.PI / 2;
+    earth.position.y = EARTH_DISK_Y;
+    earth.name = "earth-surface";
+    group.add(earth);
   }
 
-  for (let i = 0; i < 180; i += 1) {
-    const { x, z } = randomPointInRing(20, 420);
-    group.add(makeBush(x, z, 0.5 + Math.random() * 0.4));
-  }
-
-  return group;
-}
-
-function createNeighborhoodScale() {
-  const group = new THREE.Group();
-  addNeighborhoodCluster(group, 560, 420, { roads: 3, span: 420 });
-  return group;
-}
-
-function createCityScale() {
-  const group = new THREE.Group();
-
-  const totalTowers = CITY_CENTERS.length * 16;
-  const towers = new THREE.InstancedMesh(
-    new THREE.BoxGeometry(1, 1, 1),
-    new THREE.MeshLambertMaterial(),
-    totalTowers,
-  );
-  const dummy = new THREE.Object3D();
-  const color = new THREE.Color();
-  let towerIdx = 0;
-  for (const center of CITY_CENTERS) {
-    for (let i = 0; i < 16; i += 1) {
-      const w = 65 + Math.random() * 70;
-      const h = 200 + Math.random() * 700;
-      const d = 65 + Math.random() * 70;
-      const angle = (i / 16) * Math.PI * 2 + (Math.random() - 0.5) * 0.25;
-      const radius = 260 + Math.random() * 620;
-      const projected = clampToEarth(
-        center.x + Math.cos(angle) * radius,
-        center.z + Math.sin(angle) * radius,
-        420,
-      );
-      dummy.position.set(projected.x, h / 2, projected.z);
-      dummy.rotation.set(0, 0, 0);
-      dummy.scale.set(w, h, d);
-      dummy.updateMatrix();
-      towers.setMatrixAt(towerIdx, dummy.matrix);
-      color.setHSL(0.58, 0.05, 0.36 + Math.random() * 0.22);
-      towers.setColorAt(towerIdx, color);
-      towerIdx += 1;
-    }
-  }
-  towers.instanceMatrix.needsUpdate = true;
-  if (towers.instanceColor) {
-    towers.instanceColor.needsUpdate = true;
-  }
-  group.add(towers);
-
-  // Outskirt neighborhoods so cities feel embedded in suburbs at larger zooms.
-  addNeighborhoodCluster(group, -2200, -300, { roads: 3, span: 420 });
-  addNeighborhoodCluster(group, 2100, 1700, { roads: 2, span: 360 });
-  addNeighborhoodCluster(group, -500, 2400, { roads: 2, span: 340 });
-
-  return group;
-}
-
-function createEarthScale() {
-  const group = new THREE.Group();
-
-  const earth = new THREE.Mesh(
-    new THREE.CircleGeometry(EARTH_RADIUS, 256),
-    new THREE.MeshLambertMaterial({
-      map: createEarthTexture(),
-    }),
-  );
-  earth.rotation.x = -Math.PI / 2;
-  earth.position.y = -0.14;
-  earth.name = "earth-surface";
-  group.add(earth);
-
-  group.add(createCloudLayer());
   group.add(createAtmosphereRing());
-
   return group;
 }
 
@@ -844,7 +532,7 @@ function createSunWithGlowGroup(sunRadiusWorld, x, z) {
   g.position.set(x, 0, z);
 
   // Single disk with limb-only opacity in the fragment shader — no oversized
-  // corona geometry, so log-depth quirks cannot tint distant scene fill.
+  // corona geometry (avoids yellow wash); uses log-depth chunks with the renderer.
   const glowExtent = 1.045;
   const glowGeom = new THREE.CircleGeometry(sunRadiusWorld * glowExtent, 96);
   const glowUniforms = {
@@ -862,29 +550,37 @@ function createSunWithGlowGroup(sunRadiusWorld, x, z) {
     side: THREE.DoubleSide,
     renderOrder: -40,
     vertexShader: `
-      uniform float uCoreR;
-      varying float vNormR;
-      void main() {
-        vNormR = length(position.xy) / uCoreR;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
+#include <common>
+#include <logdepthbuf_pars_vertex>
+
+uniform float uCoreR;
+varying float vNormR;
+void main() {
+  vNormR = length(position.xy) / uCoreR;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  #include <logdepthbuf_vertex>
+}
     `,
     fragmentShader: `
-      uniform float uTime;
-      uniform float uOuterNorm;
-      uniform vec3 uColor;
-      varying float vNormR;
-      void main() {
-        float pulse = 0.82 + 0.18 * sin(uTime * 1.6);
-        float breathe = 0.012 * sin(uTime * 0.85 + 0.7);
-        float inner = 0.962 + breathe;
-        float mid = 0.992 + breathe * 0.4;
-        float outer = uOuterNorm + breathe * 0.6;
-        float a = smoothstep(inner, mid, vNormR) * (1.0 - smoothstep(mid + 0.012, outer, vNormR));
-        a *= 0.52 * pulse;
-        if (a < 0.008) discard;
-        gl_FragColor = vec4(uColor, a);
-      }
+#include <common>
+#include <logdepthbuf_pars_fragment>
+
+uniform float uTime;
+uniform float uOuterNorm;
+uniform vec3 uColor;
+varying float vNormR;
+void main() {
+  float pulse = 0.82 + 0.18 * sin(uTime * 1.6);
+  float breathe = 0.012 * sin(uTime * 0.85 + 0.7);
+  float inner = 0.962 + breathe;
+  float mid = 0.992 + breathe * 0.4;
+  float outer = uOuterNorm + breathe * 0.6;
+  float a = smoothstep(inner, mid, vNormR) * (1.0 - smoothstep(mid + 0.012, outer, vNormR));
+  a *= 0.52 * pulse;
+  if (a < 0.008) discard;
+  gl_FragColor = vec4(uColor, a);
+  #include <logdepthbuf_fragment>
+}
     `,
   });
 
@@ -1035,9 +731,7 @@ function createPlanetaryScale() {
   }
 
   const sunRadiusWorld = 696_700 * kmToWorld;
-  group.add(
-    createSunWithGlowGroup(sunRadiusWorld, -780_000, anchorZ - 80_000),
-  );
+  group.add(createSunWithGlowGroup(sunRadiusWorld, -780_000, anchorZ - 80_000));
 
   return group;
 }
@@ -1382,19 +1076,17 @@ function createCosmicScale() {
 // Scene composition
 // ============================================================================
 
-function setupScene() {
+function setupScene(earthMaps) {
   // Every factory is added directly to the scene at full opacity. There is
   // no layer-fade orchestration, no per-frame opacity updates, and no name
   // map — once setupScene returns, the scene graph is complete.
   scene.add(createPicnicScale());
-  scene.add(createParkScale());
-  scene.add(createNeighborhoodScale());
-  scene.add(createCityScale());
 
-  const earth = createEarthScale();
+  const earth = createEarthScale(earthMaps);
   scene.add(earth);
   // Cache the cloud disk so animate() can spin it without re-traversing.
   cloudDisk = earth.getObjectByName("earth-clouds-disk");
+  earthSurfaceMesh = earth.getObjectByName("earth-surface");
 
   scene.add(createPlanetaryScale());
   scene.add(createKuiperBeltScale());
@@ -1412,11 +1104,14 @@ function updateCamera() {
   // Keep everything in frustum: farthest point is at most ~distanceWorld + SCENE_RADIUS
   // along the top-down ray (plus diagonal slack). Old `5 * distanceWorld` clipped
   // Kuiper / Oort / galaxy until the camera crossed an exponent threshold.
-  camera.near = Math.max(1e-5, distanceWorld / 200_000);
+  // Match logarithmic depth buffer with custom ShaderMaterials (Earth, clouds, sun).
+  // Tight near/far still clip—add slack on far and a gentler near scale so less cuts off.
+  camera.near = Math.max(1e-6, distanceWorld / 1_000_000);
   camera.far = Math.max(
     100_000,
-    distanceWorld + SCENE_RADIUS * 2.5,
-    SCENE_RADIUS * 2.5,
+    distanceWorld + SCENE_RADIUS * 3.25,
+    SCENE_RADIUS * 3.25,
+    Math.hypot(distanceWorld, SCENE_RADIUS * 2.8) + SCENE_RADIUS * 0.5,
   );
   camera.updateProjectionMatrix();
 
@@ -1478,6 +1173,16 @@ function animate() {
 
   if (cloudDisk) {
     cloudDisk.rotation.z += dt * 0.02;
+  }
+
+  if (earthSurfaceMesh?.material?.uniforms?.uSphereCenter) {
+    earthSurfaceMesh.updateWorldMatrix(true, false);
+    earthSurfaceMesh.getWorldPosition(_earthCenterScratch);
+    earthSurfaceMesh.material.uniforms.uSphereCenter.value.set(
+      _earthCenterScratch.x,
+      _earthCenterScratch.y - EARTH_RADIUS,
+      _earthCenterScratch.z,
+    );
   }
 
   if (sunGlowTimeUniform) {
@@ -1557,6 +1262,18 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-setupScene();
-updateCamera();
-animate();
+loadEarthTextureSet()
+  .then((maps) => {
+    setupScene(maps);
+    updateCamera();
+    animate();
+  })
+  .catch((err) => {
+    console.warn(
+      "Earth textures failed to load; using fallback ocean disk.",
+      err,
+    );
+    setupScene(null);
+    updateCamera();
+    animate();
+  });
