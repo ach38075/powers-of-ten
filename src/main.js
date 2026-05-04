@@ -44,6 +44,8 @@ scene.add(sunLight);
 
 // Direct reference for animated scene content; populated in setupScene().
 let cloudDisk = null;
+/** Populated by createSunWithGlowGroup — limb shader time uniform */
+let sunGlowTimeUniform = null;
 
 const metersPerWorldUnit = 1;
 const EARTH_RADIUS = 6700;
@@ -155,7 +157,8 @@ function fbm2D(x, y, octaves = 4) {
 // Sprite + procedural texture helpers
 // ============================================================================
 
-function createRoundSpriteTexture(size = 64) {
+/** Wider, softer falloff for star points — reads as glow with additive blending. */
+function createStarGlowSpriteTexture(size = 128) {
   const spriteCanvas = document.createElement("canvas");
   spriteCanvas.width = size;
   spriteCanvas.height = size;
@@ -164,7 +167,7 @@ function createRoundSpriteTexture(size = 64) {
     return null;
   }
   const center = size / 2;
-  const radius = size * 0.45;
+  const radius = size * 0.49;
   const grad = ctx.createRadialGradient(
     center,
     center,
@@ -174,8 +177,10 @@ function createRoundSpriteTexture(size = 64) {
     radius,
   );
   grad.addColorStop(0.0, "rgba(255,255,255,1)");
-  grad.addColorStop(0.55, "rgba(255,255,255,0.95)");
-  grad.addColorStop(1.0, "rgba(255,255,255,0)");
+  grad.addColorStop(0.12, "rgba(255,252,248,0.92)");
+  grad.addColorStop(0.35, "rgba(255,238,220,0.45)");
+  grad.addColorStop(0.62, "rgba(255,210,170,0.16)");
+  grad.addColorStop(1.0, "rgba(255,190,150,0)");
   ctx.fillStyle = grad;
   ctx.beginPath();
   ctx.arc(center, center, radius, 0, Math.PI * 2);
@@ -833,32 +838,116 @@ function createEarthScale() {
   return group;
 }
 
+function createSunWithGlowGroup(sunRadiusWorld, x, z) {
+  const g = new THREE.Group();
+  g.name = "sun-scale-root";
+  g.position.set(x, 0, z);
+
+  // Single disk with limb-only opacity in the fragment shader — no oversized
+  // corona geometry, so log-depth quirks cannot tint distant scene fill.
+  const glowExtent = 1.045;
+  const glowGeom = new THREE.CircleGeometry(sunRadiusWorld * glowExtent, 96);
+  const glowUniforms = {
+    uTime: { value: 0 },
+    uCoreR: { value: sunRadiusWorld },
+    uOuterNorm: { value: glowExtent },
+    uColor: { value: new THREE.Color(0xff9a44) },
+  };
+  const glowMat = new THREE.ShaderMaterial({
+    uniforms: glowUniforms,
+    transparent: true,
+    depthWrite: false,
+    depthTest: true,
+    blending: THREE.NormalBlending,
+    side: THREE.DoubleSide,
+    renderOrder: -40,
+    vertexShader: `
+      uniform float uCoreR;
+      varying float vNormR;
+      void main() {
+        vNormR = length(position.xy) / uCoreR;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float uTime;
+      uniform float uOuterNorm;
+      uniform vec3 uColor;
+      varying float vNormR;
+      void main() {
+        float pulse = 0.82 + 0.18 * sin(uTime * 1.6);
+        float breathe = 0.012 * sin(uTime * 0.85 + 0.7);
+        float inner = 0.962 + breathe;
+        float mid = 0.992 + breathe * 0.4;
+        float outer = uOuterNorm + breathe * 0.6;
+        float a = smoothstep(inner, mid, vNormR) * (1.0 - smoothstep(mid + 0.012, outer, vNormR));
+        a *= 0.52 * pulse;
+        if (a < 0.008) discard;
+        gl_FragColor = vec4(uColor, a);
+      }
+    `,
+  });
+
+  const glow = new THREE.Mesh(glowGeom, glowMat);
+  glow.rotation.x = -Math.PI / 2;
+  g.add(glow);
+
+  sunGlowTimeUniform = glowUniforms.uTime;
+
+  const core = new THREE.Mesh(
+    new THREE.CircleGeometry(sunRadiusWorld, 80),
+    new THREE.MeshBasicMaterial({
+      color: 0xfffef5,
+      depthTest: true,
+      depthWrite: true,
+      renderOrder: -39,
+    }),
+  );
+  core.rotation.x = -Math.PI / 2;
+  g.add(core);
+
+  return g;
+}
+
+function planetMaterial(hex) {
+  return new THREE.MeshStandardMaterial({
+    color: hex,
+    emissive: hex,
+    emissiveIntensity: 0.22,
+    roughness: 0.91,
+    metalness: 0.03,
+  });
+}
+
 function createPlanetaryScale() {
   const group = new THREE.Group();
   const kmToWorld = EARTH_RADIUS / 6_371;
   const anchorZ = 0;
   const sunCenter = new THREE.Vector2(-780_000, anchorZ - 80_000);
 
+  // Realistic palette: Mercury gray, Venus cream clouds, Mars iron oxide rust,
+  // Jupiter ammonia bands (sandy), Saturn pale ammonia ice, Uranus methane cyan,
+  // Neptune deep methane blue.
   const innerPlanets = [
     {
       radiusKm: 2_440,
-      color: 0xff2e2e,
+      color: 0xb0aca4,
       x: -38_000,
       z: anchorZ - 1_500,
       orbitAngle: 2.55,
     },
     {
       radiusKm: 6_052,
-      color: 0xff8e1a,
+      color: 0xd4c28a,
       x: -24_000,
       z: anchorZ + 900,
       orbitAngle: 2.0,
     },
     {
       radiusKm: 3_390,
-      color: 0xffdb3a,
+      color: 0xb5553c,
       x: 24_000,
-      z: anchorZ - 1_100,
+      z: anchorZ - 1100,
       orbitAngle: 0.65,
     },
   ];
@@ -871,7 +960,7 @@ function createPlanetaryScale() {
     const z = sunCenter.y + Math.sin(planet.orbitAngle) * radiusFromSun;
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(planet.radiusKm * kmToWorld, 26, 16),
-      new THREE.MeshBasicMaterial({ color: planet.color }),
+      planetMaterial(planet.color),
     );
     mesh.position.set(x, 0, z);
     group.add(mesh);
@@ -880,28 +969,28 @@ function createPlanetaryScale() {
   const outerPlanets = [
     {
       radiusKm: 69_911,
-      color: 0x31c94e,
+      color: 0xc0a075,
       x: 140_000,
       z: anchorZ + 6_000,
       orbitAngle: 1.1,
     },
     {
       radiusKm: 58_232,
-      color: 0x3d72ff,
+      color: 0xd8c9a0,
       x: 400_000,
       z: anchorZ - 6_000,
       orbitAngle: 0.38,
     },
     {
       radiusKm: 25_362,
-      color: 0x8e44ff,
+      color: 0x62c9db,
       x: 620_000,
       z: anchorZ + 5_000,
       orbitAngle: -0.55,
     },
     {
       radiusKm: 24_622,
-      color: 0xff5fb5,
+      color: 0x2a52c4,
       x: 730_000,
       z: anchorZ - 7_000,
       orbitAngle: -1.12,
@@ -916,7 +1005,7 @@ function createPlanetaryScale() {
     const z = sunCenter.y + Math.sin(planet.orbitAngle) * radiusFromSun;
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(planet.radiusKm * kmToWorld, 28, 18),
-      new THREE.MeshBasicMaterial({ color: planet.color }),
+      planetMaterial(planet.color),
     );
     mesh.position.set(x, 0, z);
     group.add(mesh);
@@ -928,11 +1017,15 @@ function createPlanetaryScale() {
           planet.radiusKm * kmToWorld * 1.9,
           64,
         ),
-        new THREE.MeshBasicMaterial({
-          color: 0xd8d2bf,
+        new THREE.MeshStandardMaterial({
+          color: 0xc8bfa2,
+          emissive: 0x6a5e48,
+          emissiveIntensity: 0.12,
           side: THREE.DoubleSide,
           transparent: true,
-          opacity: 0.8,
+          opacity: 0.82,
+          roughness: 0.95,
+          metalness: 0,
         }),
       );
       ring.rotation.set(-Math.PI / 2 + 0.26, 0.0, 0.36);
@@ -941,14 +1034,10 @@ function createPlanetaryScale() {
     }
   }
 
-  // Flat sun disk reads cleaner than a sphere in top-down composition.
-  const sun = new THREE.Mesh(
-    new THREE.CircleGeometry(696_700 * kmToWorld, 64),
-    new THREE.MeshBasicMaterial({ color: 0xffc06b }),
+  const sunRadiusWorld = 696_700 * kmToWorld;
+  group.add(
+    createSunWithGlowGroup(sunRadiusWorld, -780_000, anchorZ - 80_000),
   );
-  sun.rotation.x = -Math.PI / 2;
-  sun.position.set(-780_000, 0, anchorZ - 80_000);
-  group.add(sun);
 
   return group;
 }
@@ -978,19 +1067,21 @@ function createKuiperBeltScale() {
   const geom = new THREE.BufferGeometry();
   geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  const kuiperGlow = createStarGlowSpriteTexture(96);
   group.add(
     new THREE.Points(
       geom,
       new THREE.PointsMaterial({
         vertexColors: true,
-        // Constant-pixel sizing so Kuiper rocks remain visible across the
-        // 5+ orders of magnitude in camera distance the layer spans. With
-        // sizeAttenuation: true the original 62-world-unit size projected
-        // to ~1e-6 px at the layer's intended camera height.
-        size: 2.5,
+        map: kuiperGlow,
+        alphaMap: kuiperGlow,
+        alphaTest: 0.02,
+        size: 3.2,
         sizeAttenuation: false,
         transparent: true,
-        opacity: 0.92,
+        opacity: 0.88,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
       }),
     ),
   );
@@ -1015,15 +1106,21 @@ function createOortCloudScale() {
   }
   const geom = new THREE.BufferGeometry();
   geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  const oortGlow = createStarGlowSpriteTexture(96);
   group.add(
     new THREE.Points(
       geom,
       new THREE.PointsMaterial({
         color: 0xd8ecff,
-        size: 1.8,
+        map: oortGlow,
+        alphaMap: oortGlow,
+        alphaTest: 0.02,
+        size: 2.45,
         sizeAttenuation: false,
         transparent: true,
-        opacity: 0.55,
+        opacity: 0.65,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
       }),
     ),
   );
@@ -1043,7 +1140,7 @@ function createGalacticScale() {
   const starsPerArm = 16_000;
   const haloCount = 10_500;
   const brightBodyCount = 420;
-  const roundSprite = createRoundSpriteTexture();
+  const starGlowSprite = createStarGlowSpriteTexture();
   // Layered reveal: sparse first (closer), then denser farther away.
   const sparseLayerY = 0;
   const midLayerY = -260_000_000;
@@ -1086,14 +1183,16 @@ function createGalacticScale() {
         // visible across the entire Milky Way zoom range. With attenuation
         // on, the previous 2M-world-unit size projected to ~4e-9 px at the
         // layer's intended camera distance.
-        size: 2.2,
+        size: 2.85,
         sizeAttenuation: false,
-        map: roundSprite,
-        alphaMap: roundSprite,
-        alphaTest: 0.15,
+        map: starGlowSprite,
+        alphaMap: starGlowSprite,
+        alphaTest: 0.02,
         vertexColors: true,
         transparent: true,
-        opacity: 0.92,
+        opacity: 0.95,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
       }),
     ),
   );
@@ -1126,14 +1225,16 @@ function createGalacticScale() {
     new THREE.Points(
       haloGeom,
       new THREE.PointsMaterial({
-        size: 1.6,
+        size: 2.15,
         sizeAttenuation: false,
-        map: roundSprite,
-        alphaMap: roundSprite,
-        alphaTest: 0.15,
+        map: starGlowSprite,
+        alphaMap: starGlowSprite,
+        alphaTest: 0.02,
         vertexColors: true,
         transparent: true,
-        opacity: 0.55,
+        opacity: 0.62,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
       }),
     ),
   );
@@ -1167,14 +1268,16 @@ function createGalacticScale() {
     new THREE.Points(
       midGeom,
       new THREE.PointsMaterial({
-        size: 1.9,
+        size: 2.35,
         sizeAttenuation: false,
-        map: roundSprite,
-        alphaMap: roundSprite,
-        alphaTest: 0.15,
+        map: starGlowSprite,
+        alphaMap: starGlowSprite,
+        alphaTest: 0.02,
         vertexColors: true,
         transparent: true,
-        opacity: 0.7,
+        opacity: 0.75,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
       }),
     ),
   );
@@ -1183,7 +1286,7 @@ function createGalacticScale() {
   // spiral reads at one draw call instead of 420.
   const brightBodies = new THREE.InstancedMesh(
     new THREE.SphereGeometry(1, 10, 8),
-    new THREE.MeshLambertMaterial(),
+    new THREE.MeshBasicMaterial(),
     brightBodyCount,
   );
   const dummy = new THREE.Object3D();
@@ -1207,9 +1310,9 @@ function createGalacticScale() {
     dummy.updateMatrix();
     brightBodies.setMatrixAt(i, dummy.matrix);
     bodyColor.setHSL(
-      0.02 + Math.random() * 0.62,
-      0.42 + Math.random() * 0.38,
-      0.54 + Math.random() * 0.26,
+      0.07 + Math.random() * 0.1,
+      0.55 + Math.random() * 0.35,
+      0.58 + Math.random() * 0.32,
     );
     brightBodies.setColorAt(i, bodyColor);
   }
@@ -1241,7 +1344,7 @@ function createCosmicScale() {
   const positions = new Float32Array(count * 3);
   const colors = new Float32Array(count * 3);
   const scaleSize = 60_000_000_000;
-  const sprite = createRoundSpriteTexture();
+  const cosmicGlow = createStarGlowSpriteTexture();
   for (let i = 0; i < count; i += 1) {
     const idx = i * 3;
     positions[idx] = center.x + (Math.random() - 0.5) * scaleSize;
@@ -1259,14 +1362,16 @@ function createCosmicScale() {
     new THREE.Points(
       geom,
       new THREE.PointsMaterial({
-        size: 2.6,
+        size: 2.85,
         sizeAttenuation: false,
-        map: sprite,
-        alphaMap: sprite,
-        alphaTest: 0.1,
+        map: cosmicGlow,
+        alphaMap: cosmicGlow,
+        alphaTest: 0.02,
         vertexColors: true,
         transparent: true,
-        opacity: 0.92,
+        opacity: 0.9,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
       }),
     ),
   );
@@ -1373,6 +1478,10 @@ function animate() {
 
   if (cloudDisk) {
     cloudDisk.rotation.z += dt * 0.02;
+  }
+
+  if (sunGlowTimeUniform) {
+    sunGlowTimeUniform.value = clock.getElapsedTime();
   }
 
   updateCamera();
