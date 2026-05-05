@@ -27,7 +27,7 @@ const maxAniso = renderer.capabilities.getMaxAnisotropy();
 const scene = new THREE.Scene();
 scene.fog = null;
 
-// Initial planes; updateCamera assigns values that always bound the full scene.
+// Initial planes; updateCamera assigns values that always bind the full scene
 const camera = new THREE.PerspectiveCamera(
   60,
   window.innerWidth / window.innerHeight,
@@ -35,13 +35,12 @@ const camera = new THREE.PerspectiveCamera(
   1e24,
 );
 
-// Single omnidirectional ambient — identical illumination everywhere (Earth disk uses
-// unlit day texture; picnic / trees use Lambert & Standard with no directional key).
+// Single omnidirectional ambient for identical illumination everywhere
 const ambient = new THREE.AmbientLight(0xf4f7ff, 1.88);
 scene.add(ambient);
 
 // Fullscreen fade in front of the camera while passing through the cloud deck
-// (avoids global fog, which would wash out the cosmos).
+// to avoid global fog washing out the cosmos.
 const cloudFadeGeom = new THREE.PlaneGeometry(1, 1);
 const cloudFadeMat = new THREE.MeshBasicMaterial({
   color: 0xf2f7fc,
@@ -71,35 +70,32 @@ refreshCloudFadeQuadSize();
 // Constants + state
 // ============================================================================
 
-// Direct reference for animated scene content; populated in setupScene().
+// Direct reference for animated scene content
 let cloudDisk = null;
-/** Populated by createSunWithGlowGroup — limb shader time uniform */
+// Populated by createSunWithGlowGroup
 let sunGlowTimeUniform = null;
-/** Earth surface mesh when using realistic shaders — used to refresh globe uniforms. */
+// Earth surface mesh when using realistic shaders to refresh globe uniforms.
 let earthSurfaceMesh = null;
-/** Picnic trees / towers / bushes / houses — visibility tied to zoom in animate(). */
+// Picnic trees / towers / bushes / houses visibility tied to zoom in animate().
 let picnicSurroundGroup = null;
 
 const _earthCenterScratch = new THREE.Vector3();
 
-// Show surrounding props once the camera has pulled back enough (10^x m).
+// Show surrounding props once the camera has pulled back enough
 const PICNIC_SURROUND_REVEAL_START = -10;
 const PICNIC_SURROUND_REVEAL_END = 1.15;
 
 const metersPerWorldUnit = 1;
 const EARTH_RADIUS = 6700;
 
-// Orthographic globe mapping: sphere center lies R below the north pole on the disk.
-// Disk plane is y = -0.14 (earth surface mesh position); picnic stays at origin on that disk.
+// Orthographic globe mapping: sphere center lies R below the north pole on the disk
 const EARTH_DISK_Y = -0.14;
-/** Cloud deck group Y (world); must match createCloudLayer wrapper.position.y. */
+// Cloud deck group Y (world); must match createCloudLayer wrapper.position.y
 const CLOUD_DISK_WORLD_Y = 70;
-/** Descending from space: opacity clears by this height above the deck (m). */
+// Descending from space: opacity clears by this height above the deck
 const CLOUD_FADE_SPAN_ABOVE = 100;
-/**
- * Below-deck fade uses log10(camera Y): camera moves as 10^exponent, so a linear-Y ramp
- * only spans a tiny exponent window (instant pop). Fade from ~this height (m) up to the deck.
- */
+// Below-deck fade uses log10(camera Y): camera moves as 10^exponent, so a linear-Y ramp
+// only spans a tiny exponent window (instant pop). Fade from ~this height up to the deck.
 const CLOUD_FADE_NEAR_GROUND_Y = 40;
 const EARTH_SPHERE_CENTER = new THREE.Vector3(
   0,
@@ -108,11 +104,8 @@ const EARTH_SPHERE_CENTER = new THREE.Vector3(
 );
 
 // Rotate globe sampling so the disk center (picnic + park + city at world origin)
-// sits over this lat/lon on the day map (EPSG-style: +N, +E; west longitudes negative).
-// Tweaking `lat` / `lon` moves the whole picnic scene on Earth. Examples:
-//   Ireland (lush / bright green on many Blue-Marble-style maps): ~53.2°N, 8.0°W
-//   Willamette Valley, OR: ~44.9°N, 123.0°W
-//   Central NZ (South Island): ~43.8°S ⇒ use negative lat in `Math.sin` / `cos` below.
+// sits over this lat/lon on the day map (EPSG-style: +N, +E; west longitudes negative)
+// Tweaking `lat` / `lon` moves the whole picnic scene on Earth
 function createGlobeTextureQuaternion() {
   const lat = THREE.MathUtils.degToRad(53.2);
   const lon = THREE.MathUtils.degToRad(-8.0);
@@ -148,14 +141,14 @@ const SCENE_RADIUS = 90_000_000_000;
 
 const minExponent = -1.7;
 
-/** Initial zoom when the page loads (tight on the blanket). */
+// Initial zoom when the page loads (tight on the blanket)
 const DEFAULT_EXPONENT = -1.2;
 /**
  * Tour return altitude: ~10^0.3 m ≈ 2 m camera height so the full picnic
- * blanket fits in a 60° vertical FOV; DEFAULT_EXPONENT is too close for that.
+ * blanket fits in a 60 degree vertical FOV; DEFAULT_EXPONENT is too close for that.
  */
 const TOUR_RETURN_EXPONENT = 0.3;
-/** Overview landmark (~10^10.65 m) — Enter tour zoom-out stops here; manual zoom shares this ceiling. */
+// Overview landmark (~10^10.65 m) Enter tour zoom-out stops here; manual zoom shares this ceiling.
 const OVERVIEW_EXPONENT = 10.65;
 const maxExponent = OVERVIEW_EXPONENT;
 const OVERVIEW_TOUR_OUT_SECONDS = 24;
@@ -338,7 +331,7 @@ void main() {
   return mat;
 }
 
-/** Wider, softer falloff for star points — reads as glow with additive blending. */
+// Wider, softer falloff for star points reads as glow with additive blending
 function createStarGlowSpriteTexture(size = 128) {
   const spriteCanvas = document.createElement("canvas");
   spriteCanvas.width = size;
@@ -380,7 +373,7 @@ function createCloudLayer(
   const wrapper = new THREE.Group();
   wrapper.name = "earth-clouds";
   wrapper.rotation.x = -Math.PI / 2;
-  // Clear separation from the surface in world Y (reduces z-fighting with log depth).
+  // Clear separation from the surface in world Y (reduces z-fighting with log depth)
   wrapper.position.y = CLOUD_DISK_WORLD_Y;
 
   const disk = new THREE.Mesh(
@@ -400,8 +393,7 @@ function createCloudLayer(
 function createAtmosphereRing() {
   const group = new THREE.Group();
   group.name = "earth-atmosphere";
-  // Stacked rings of decreasing opacity approximate a soft fade outward without
-  // requiring a custom shader or a baked ring texture with awkward UV mapping.
+  // Stacked rings of decreasing opacity approximate a soft fade outward
   const layers = [
     { inner: 1.0, outer: 1.012, opacity: 0.55 },
     { inner: 1.012, outer: 1.025, opacity: 0.32 },
@@ -475,8 +467,7 @@ function createLyingPerson(options = {}) {
 }
 
 /**
- * Large urban park (~124 m fenced lawn) around the picnic, then city blocks outside
- * the fence. Spacing is in meters (1 world unit ≈ 1 m).
+ * Large urban park around the picnic, then city blocks outside the fence.
  */
 function createPicnicSurroundings() {
   const group = new THREE.Group();
@@ -491,21 +482,14 @@ function createPicnicSurroundings() {
     return (seed >>> 0) / 0xffffffff;
   };
 
-  /** Picnic blanket clearance (m). Blanket mesh is 2.2 × 1.4 (±1.1, ±0.7); pad
-   * past that so scaled tree trunks / crowns do not read on the blanket. */
+  // Picnic blanket clearance
   const excludeHalfX = 1.22;
-  const excludeHalfZ = 1.00;
-  /** Half-size of fenced lawn (full width ≈ ~15.5 m vs original ~124 m). */
+  const excludeHalfZ = 1.0;
+  // Half-size of fenced lawn (full width ≈ ~15.5 m vs original ~124 m)
   const FENCE_HALF = 7.75;
-  /** Fence posts roughly every this many meters along perimeter. */
+  // Fence posts roughly every this many meters along perimeter
   const FENCE_POST_SPACING = 2.45;
   // === City grid: axis-aligned blocks around the park ===
-  // Park sits at world origin. Outside the fence: a grass strip, then a
-  // perimeter ring road, then a square grid of grass lots in 4 quadrants.
-  // Major avenues continue along ±x / ±z; narrow streets sit between lots.
-  // Sized so streets read as paths, not freeway -- each lot is much wider
-  // than the road around it so the city blends with the park instead of
-  // floating in asphalt.
   const STRIP_W = 1.5;
   const RING_ROAD_W = 1.4;
   const BLOCK_W = 7.2;
@@ -519,10 +503,10 @@ function createPicnicSurroundings() {
   const lotAxisCenter = (n) =>
     RING_ROAD_OUTER + STREET_W / 2 + n * BLOCK_PITCH + BLOCK_W / 2;
   // City extent ends flush with the outer block edge -- no trailing
-  // half-street outside the last ring (cuts the asphalt frame down a lot).
+  // half-street outside the last ring
   const CITY_HALF = lotAxisCenter(RINGS - 1) + BLOCK_W / 2;
 
-  /** One descriptor per sidewalk lot: lot center + ring index (0=closest to park). */
+  // One descriptor per sidewalk lot: lot center + ring index (0=closest to park)
   const cityBlocks = [];
   for (let qi = 0; qi < RINGS; qi += 1) {
     for (let qj = 0; qj < RINGS; qj += 1) {
@@ -542,7 +526,7 @@ function createPicnicSurroundings() {
     return Math.abs(x) < excludeHalfX && Math.abs(z) < excludeHalfZ;
   }
 
-  /** Uniform point on the lawn, not on the blanket. */
+  // Uniform point on the lawn
   function sampleParkLawn() {
     const inset = 1.0;
     const lim = FENCE_HALF - inset;
@@ -555,7 +539,7 @@ function createPicnicSurroundings() {
     return { x: lim * 0.6, z: lim * 0.35 };
   }
 
-  /** Post i of n around a square from (-H,-H) to (H,H), CCW from bottom edge. */
+  // Post i of n around a square from (-H,-H) to (H,H), CCW from bottom edge
   function fencePostXZ(index, count, H) {
     const side = 2 * H;
     let u = (index / count) * (8 * H);
@@ -628,10 +612,6 @@ function createPicnicSurroundings() {
   addRail(railW, railT, sideLen + railW, FENCE_HALF, railY - 0.34, 0);
 
   // === Roads ===
-  // Warm gravel rather than highway-black so the streets read as a small
-  // village, not a downtown grid. Drawn as explicit strips (ring road +
-  // streets between blocks + 4 axis avenues) so the visible asphalt is just
-  // the road network -- everything else is lawn.
   const roadGeom = new THREE.BoxGeometry(1, 0.005, 1);
   const roadMat = new THREE.MeshLambertMaterial({
     color: 0x4f463a,
@@ -648,14 +628,34 @@ function createPicnicSurroundings() {
     group.add(m);
   };
 
-  // Ring road around the park (4 strips forming a square donut).
-  addRoadStrip(-RING_ROAD_OUTER, RING_ROAD_INNER, RING_ROAD_OUTER, RING_ROAD_OUTER);
-  addRoadStrip(-RING_ROAD_OUTER, -RING_ROAD_OUTER, RING_ROAD_OUTER, -RING_ROAD_INNER);
-  addRoadStrip(-RING_ROAD_OUTER, -RING_ROAD_INNER, -RING_ROAD_INNER, RING_ROAD_INNER);
-  addRoadStrip(RING_ROAD_INNER, -RING_ROAD_INNER, RING_ROAD_OUTER, RING_ROAD_INNER);
+  // Ring road around the park
+  addRoadStrip(
+    -RING_ROAD_OUTER,
+    RING_ROAD_INNER,
+    RING_ROAD_OUTER,
+    RING_ROAD_OUTER,
+  );
+  addRoadStrip(
+    -RING_ROAD_OUTER,
+    -RING_ROAD_OUTER,
+    RING_ROAD_OUTER,
+    -RING_ROAD_INNER,
+  );
+  addRoadStrip(
+    -RING_ROAD_OUTER,
+    -RING_ROAD_INNER,
+    -RING_ROAD_INNER,
+    RING_ROAD_INNER,
+  );
+  addRoadStrip(
+    RING_ROAD_INNER,
+    -RING_ROAD_INNER,
+    RING_ROAD_OUTER,
+    RING_ROAD_INNER,
+  );
 
-  // Streets between block columns (and the half-street next to the ring road).
-  // Each entry is one street center on the +axis side; reflected to -axis.
+  // Streets between block columns (and the half-street next to the ring road)
+  // Each entry is one street center on the +axis side; reflected to -axis
   const streetSegs = [
     { c: RING_ROAD_OUTER + STREET_W / 4, halfW: STREET_W / 4 },
   ];
@@ -669,7 +669,7 @@ function createPicnicSurroundings() {
   for (const sign of [-1, 1]) {
     for (const seg of streetSegs) {
       const sCenter = sign * seg.c;
-      // Vertical street (constant x, runs both +z and -z halves).
+      // Vertical street (constant x, runs both +z and -z halves)
       addRoadStrip(
         sCenter - seg.halfW,
         RING_ROAD_INNER,
@@ -682,7 +682,7 @@ function createPicnicSurroundings() {
         sCenter + seg.halfW,
         -RING_ROAD_INNER,
       );
-      // Horizontal street (constant z).
+      // Horizontal street (constant z)
       addRoadStrip(
         RING_ROAD_INNER,
         sCenter - seg.halfW,
@@ -697,24 +697,20 @@ function createPicnicSurroundings() {
       );
     }
   }
-  // Major avenues continuing along the ±x and ±z axes between quadrants.
+  // Major avenues continuing along the ±x and ±z axes between quadrants
   addRoadStrip(-CITY_HALF, -STREET_W / 2, -RING_ROAD_OUTER, STREET_W / 2);
   addRoadStrip(RING_ROAD_OUTER, -STREET_W / 2, CITY_HALF, STREET_W / 2);
   addRoadStrip(-STREET_W / 2, -CITY_HALF, STREET_W / 2, -RING_ROAD_OUTER);
   addRoadStrip(-STREET_W / 2, RING_ROAD_OUTER, STREET_W / 2, CITY_HALF);
 
-  // === Lawn lots (one grass square per lot — buildings/houses sit on these) ===
+  // === Lawn lots (one grass square per lot buildings/houses sit on these) ===
   const lawnGeom = new THREE.BoxGeometry(BLOCK_W, 0.006, BLOCK_W);
   const lawnMat = new THREE.MeshLambertMaterial({
     color: 0x6cae5c,
     emissive: 0x244c1c,
     emissiveIntensity: 0.32,
   });
-  const lawns = new THREE.InstancedMesh(
-    lawnGeom,
-    lawnMat,
-    cityBlocks.length,
-  );
+  const lawns = new THREE.InstancedMesh(lawnGeom, lawnMat, cityBlocks.length);
   lawns.frustumCulled = false;
   for (let i = 0; i < cityBlocks.length; i += 1) {
     const { cx, cz } = cityBlocks[i];
@@ -727,7 +723,7 @@ function createPicnicSurroundings() {
   lawns.instanceMatrix.needsUpdate = true;
   group.add(lawns);
 
-  // Street trees at the four corners of every sidewalk lot.
+  // Street trees at the four corners of every sidewalk lot
   const streetTrees = [];
   for (const block of cityBlocks) {
     const cornerInset = 0.45;
@@ -740,9 +736,7 @@ function createPicnicSurroundings() {
     );
   }
 
-  // Trees outside the built-up square — sparse scatter in a wide belt (same
-  // count as before: target is derived from a fixed reference extent, not the
-  // wider sample box, so widening does not add instances).
+  // Trees outside the built-up square sparse scatter in a wide belt
   const outerTreeRefHalf = CITY_HALF + 18;
   const outerTreeTarget = Math.max(
     72,
@@ -823,9 +817,6 @@ function createPicnicSurroundings() {
   group.add(treeTrunks, treeCrowns);
 
   // === Commercial buildings on inner rings (closest to the park) ===
-  // Each lot picks a random site plan (one big building, two side-by-side, or
-  // 3-4 small ones on a 2x2 sub-grid). Per-building rotation, footprint, and
-  // position jitter keep adjacent blocks from looking stamped.
   const COMMERCIAL_PALETTE = [
     0xff8a72, 0xffd166, 0x7ec4cf, 0xa3e4a8, 0xb8a4dc, 0xffb482, 0xffd1dc,
     0x90c8e8, 0xff9bb3, 0xb6e388, 0xf6c453, 0xfcb1a6, 0xa9e0d4,
@@ -1060,8 +1051,7 @@ function createPicnicSurroundings() {
   benchBacks.instanceMatrix.needsUpdate = true;
   group.add(benchSeats, benchBacks);
 
-  // === Small houses on the outer ring (peaked roofs, bright pastel walls) ===
-  // Brighter pastels + warmer roof palette so they read as cottages from above.
+  // === Small houses on the outer ring ===
   const HOUSE_PALETTE = [
     0xfff3c4, 0xffe18a, 0xffb3a3, 0xc6e6ff, 0xe5cdf5, 0xc6e8a8, 0xffeab0,
     0xffd9bf, 0xffd1dc, 0xd6ecff, 0xfff0a8, 0xdaf0c8, 0xffc8a8, 0xc4f0d4,
@@ -1075,7 +1065,7 @@ function createPicnicSurroundings() {
     if (block.ring < 2) continue;
     const plan = rnd();
     if (plan < 0.18) {
-      // Single bigger house centered on the lot.
+      // Single bigger house centered on the lot
       houseCells.push({
         x: block.cx + (rnd() - 0.5) * 0.5,
         z: block.cz + (rnd() - 0.5) * 0.5,
@@ -1086,7 +1076,7 @@ function createPicnicSurroundings() {
         roofHex: ROOF_PALETTE[Math.floor(rnd() * ROOF_PALETTE.length)],
       });
     } else if (plan < 0.42) {
-      // Two side-by-side houses.
+      // Two side-by-side houses
       const alongX = rnd() < 0.5;
       for (const s of [-1, 1]) {
         houseCells.push({
@@ -1100,7 +1090,7 @@ function createPicnicSurroundings() {
         });
       }
     } else {
-      // Three or four small cottages.
+      // Three or four small cottages
       const dropRate = plan < 0.72 ? 0.32 : 0.08;
       for (const si of [-1, 1]) {
         for (const sj of [-1, 1]) {
@@ -1121,8 +1111,7 @@ function createPicnicSurroundings() {
 
   const houseCount = houseCells.length;
   const houseBoxGeom = new THREE.BoxGeometry(1, 1, 1);
-  // Square pyramid (4-sided cone with side faces aligned to x/z axes after
-  // a 45° yaw): unit-cube base when scaled by (w, h, d).
+  // Square pyramid
   const houseRoofGeom = new THREE.ConeGeometry(Math.SQRT1_2, 1, 4);
   houseRoofGeom.rotateY(Math.PI / 4);
   const houseBodyMat = new THREE.MeshLambertMaterial({
@@ -1203,15 +1192,12 @@ function createPicnicSurroundings() {
   }
   group.add(houseBodies, houseTrims, houseRoofs);
 
-  // === Yard greenery on commercial+residential lots (homier feel) ===
-  // Random bush sprinkles inside each lot. Some overlap with buildings is
-  // intentional -- reads as foundation plantings / front-yard shrubs.
+  // === Yard greenery on commercial+residential lots ===
   const yardBushPositions = [];
   for (const block of cityBlocks) {
     if (block.ring < 1) continue; // skip the small "downtown" core
-    const cnt = block.ring === 2
-      ? 3 + Math.floor(rnd() * 3)
-      : 1 + Math.floor(rnd() * 2);
+    const cnt =
+      block.ring === 2 ? 3 + Math.floor(rnd() * 3) : 1 + Math.floor(rnd() * 2);
     for (let n = 0; n < cnt; n += 1) {
       const ox = (rnd() - 0.5) * (BLOCK_W - 0.6);
       const oz = (rnd() - 0.5) * (BLOCK_W - 0.6);
@@ -1372,8 +1358,6 @@ function createSunWithGlowGroup(sunRadiusWorld, x, z) {
   g.name = "sun-scale-root";
   g.position.set(x, 0, z);
 
-  // Single disk with limb-only opacity in the fragment shader — no oversized
-  // corona geometry (avoids yellow wash); uses log-depth chunks with the renderer.
   const glowExtent = 1.045;
   const glowGeom = new THREE.CircleGeometry(sunRadiusWorld * glowExtent, 96);
   const glowUniforms = {
@@ -1462,9 +1446,6 @@ function createPlanetaryScale() {
   const anchorZ = 0;
   const sunCenter = new THREE.Vector2(-780_000, anchorZ - 80_000);
 
-  // Realistic palette: Mercury gray, Venus cream clouds, Mars iron oxide rust,
-  // Jupiter ammonia bands (sandy), Saturn pale ammonia ice, Uranus methane cyan,
-  // Neptune deep methane blue.
   const innerPlanets = [
     {
       radiusKm: 2_440,
@@ -1676,14 +1657,11 @@ function createGalacticScale() {
   const haloCount = 10_500;
   const brightBodyCount = 420;
   const starGlowSprite = createStarGlowSpriteTexture();
-  // Layered reveal: sparse first (closer), then denser farther away.
+
   const sparseLayerY = 0;
   const midLayerY = -260_000_000;
   const denseLayerY = -560_000_000;
-  // Earth / picnic sit near y≈0; camera is on +Y looking toward origin. The
-  // spiral used large negative Y, so arm stars and bright spheres sat past
-  // Earth along −Y and depth-tested behind the globe. Lift all Y samples so
-  // the dense arm plane (worst-case downward noise) clears +y with margin.
+
   const armSpreadHalf = 0.5 * (460_000_000 + galaxyRadius * 0.05);
   const armPlaneY = galacticCenter.y + denseLayerY;
   const galacticYLift = -(armPlaneY - armSpreadHalf) + 85_000_000;
@@ -1723,9 +1701,7 @@ function createGalacticScale() {
       armGeom,
       new THREE.PointsMaterial({
         // Stars render at constant pixel size so the spiral pattern is
-        // visible across the entire Milky Way zoom range. With attenuation
-        // on, the previous 2M-world-unit size projected to ~4e-9 px at the
-        // layer's intended camera distance.
+        // visible across the entire Milky Way zoom range
         size: 2.85,
         sizeAttenuation: false,
         map: starGlowSprite,
@@ -1827,8 +1803,6 @@ function createGalacticScale() {
     ),
   );
 
-  // 420 bright bodies are batched into a single InstancedMesh so the dense
-  // spiral reads at one draw call instead of 420.
   const brightBodies = new THREE.InstancedMesh(
     new THREE.SphereGeometry(1, 10, 8),
     new THREE.MeshBasicMaterial(),
@@ -1868,7 +1842,7 @@ function createGalacticScale() {
   }
   group.add(brightBodies);
 
-  // Massive black hole at the galactic center.
+  // Massive black hole at the galactic center
   const blackHole = new THREE.Mesh(
     new THREE.SphereGeometry(70_000_000, 36, 24),
     new THREE.MeshBasicMaterial({ color: 0x030303 }),
@@ -1929,14 +1903,11 @@ function createCosmicScale() {
 // ============================================================================
 
 function setupScene(earthMaps) {
-  // Every factory is added directly to the scene at full opacity. There is
-  // no layer-fade orchestration, no per-frame opacity updates, and no name
-  // map — once setupScene returns, the scene graph is complete.
   scene.add(createPicnicScale());
 
   const earth = createEarthScale(earthMaps);
   scene.add(earth);
-  // Cache the cloud disk so animate() can spin it without re-traversing.
+
   cloudDisk = earth.getObjectByName("earth-clouds-disk");
   earthSurfaceMesh = earth.getObjectByName("earth-surface");
 
@@ -1953,11 +1924,6 @@ function updateCamera() {
   camera.position.set(0, distanceWorld + 0.5, 0);
   camera.lookAt(0, 0, 0);
 
-  // Keep everything in frustum: farthest point is at most ~distanceWorld + SCENE_RADIUS
-  // along the top-down ray (plus diagonal slack). Old `5 * distanceWorld` clipped
-  // Kuiper / Oort / galaxy until the camera crossed an exponent threshold.
-  // Match logarithmic depth buffer with custom ShaderMaterials (Earth, clouds, sun).
-  // Tight near/far still clip—add slack on far and a gentler near scale so less cuts off.
   camera.near = Math.max(1e-6, distanceWorld / 1_000_000);
   camera.far = Math.max(
     100_000,
@@ -2008,7 +1974,7 @@ const clock = new THREE.Clock();
 function animate() {
   requestAnimationFrame(animate);
   // Clamp dt so a backgrounded tab does not produce a single huge step
-  // when the user returns and the clock has accumulated wall time.
+  // when the user returns and the clock has accumulated time
   const dt = Math.min(clock.getDelta(), 0.1);
 
   if (overviewTour) {
@@ -2056,16 +2022,16 @@ function animate() {
     sunGlowTimeUniform.value = clock.getElapsedTime();
   }
 
-if (picnicSurroundGroup) {
-  const t = THREE.MathUtils.smoothstep(
-    exponent,
-    PICNIC_SURROUND_REVEAL_START,
-    PICNIC_SURROUND_REVEAL_END,
-  );
+  if (picnicSurroundGroup) {
+    const t = THREE.MathUtils.smoothstep(
+      exponent,
+      PICNIC_SURROUND_REVEAL_START,
+      PICNIC_SURROUND_REVEAL_END,
+    );
 
-  picnicSurroundGroup.visible = t > 0.01;
-  picnicSurroundGroup.scale.setScalar(THREE.MathUtils.lerp(0.001, 1.0, t));
-}
+    picnicSurroundGroup.visible = t > 0.01;
+    picnicSurroundGroup.scale.setScalar(THREE.MathUtils.lerp(0.001, 1.0, t));
+  }
 
   updateCamera();
   updateCloudPenetrationFade();
@@ -2137,7 +2103,7 @@ window.addEventListener("resize", () => {
 
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
-    // Reset the clock so the first dt after returning to the tab is small.
+    // Reset the clock so the first dt after returning to the tab is small
     clock.start();
   }
 });
