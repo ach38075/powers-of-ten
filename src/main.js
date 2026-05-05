@@ -147,7 +147,6 @@ const EARTH_TEXTURE_URLS = {
 const SCENE_RADIUS = 90_000_000_000;
 
 const minExponent = -1.7;
-const maxExponent = 23;
 
 /** Initial zoom when the page loads (tight on the blanket). */
 const DEFAULT_EXPONENT = -1.2;
@@ -156,8 +155,9 @@ const DEFAULT_EXPONENT = -1.2;
  * blanket fits in a 60° vertical FOV; DEFAULT_EXPONENT is too close for that.
  */
 const TOUR_RETURN_EXPONENT = 0.3;
-/** Overview landmark (~10^10.65 m). */
+/** Overview landmark (~10^10.65 m) — Enter tour zoom-out stops here; manual zoom shares this ceiling. */
 const OVERVIEW_EXPONENT = 10.65;
+const maxExponent = OVERVIEW_EXPONENT;
 const OVERVIEW_TOUR_OUT_SECONDS = 24;
 const OVERVIEW_TOUR_IN_SECONDS = 20;
 
@@ -1269,8 +1269,8 @@ function createPicnicScale() {
   group.add(blanket);
 
   const tileSize = 0.22;
-  for (let ix = -4; ix <= 4; ix += 1) {
-    for (let iz = -2; iz <= 2; iz += 1) {
+  for (let ix = -5; ix <= 5; ix += 1) {
+    for (let iz = -3; iz <= 3; iz += 1) {
       const isRed = (ix + iz) % 2 === 0;
       const tile = new THREE.Mesh(
         new THREE.BoxGeometry(tileSize, 0.012, tileSize),
@@ -1680,6 +1680,13 @@ function createGalacticScale() {
   const sparseLayerY = 0;
   const midLayerY = -260_000_000;
   const denseLayerY = -560_000_000;
+  // Earth / picnic sit near y≈0; camera is on +Y looking toward origin. The
+  // spiral used large negative Y, so arm stars and bright spheres sat past
+  // Earth along −Y and depth-tested behind the globe. Lift all Y samples so
+  // the dense arm plane (worst-case downward noise) clears +y with margin.
+  const armSpreadHalf = 0.5 * (460_000_000 + galaxyRadius * 0.05);
+  const armPlaneY = galacticCenter.y + denseLayerY;
+  const galacticYLift = -(armPlaneY - armSpreadHalf) + 85_000_000;
 
   const armPositions = new Float32Array(armCount * starsPerArm * 3);
   const armColors = new Float32Array(armCount * starsPerArm * 3);
@@ -1697,7 +1704,8 @@ function createGalacticScale() {
       armPositions[armCursor + 1] =
         galacticCenter.y +
         denseLayerY +
-        (Math.random() - 0.5) * (460_000_000 + radius * 0.05);
+        (Math.random() - 0.5) * (460_000_000 + radius * 0.05) +
+        galacticYLift;
       armPositions[armCursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
 
       const warmth = 0.3 + Math.random() * 0.7;
@@ -1743,7 +1751,8 @@ function createGalacticScale() {
     haloPositions[haloCursor + 1] =
       galacticCenter.y +
       sparseLayerY +
-      (Math.random() - 0.5) * (380_000_000 + radius * 0.04);
+      (Math.random() - 0.5) * (380_000_000 + radius * 0.04) +
+      galacticYLift;
     haloPositions[haloCursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
     haloColors[haloCursor] = 0.55 + Math.random() * 0.2;
     haloColors[haloCursor + 1] = 0.6 + Math.random() * 0.2;
@@ -1788,7 +1797,8 @@ function createGalacticScale() {
     midPositions[midCursor + 1] =
       galacticCenter.y +
       midLayerY +
-      (Math.random() - 0.5) * (320_000_000 + radius * 0.03);
+      (Math.random() - 0.5) * (320_000_000 + radius * 0.03) +
+      galacticYLift;
     midPositions[midCursor + 2] = galacticCenter.z + Math.sin(angle) * radius;
     const c = 0.72 + Math.random() * 0.22;
     midColors[midCursor] = c;
@@ -1837,7 +1847,8 @@ function createGalacticScale() {
       galacticCenter.x + Math.cos(angle) * radius,
       galacticCenter.y +
         denseLayerY +
-        (Math.random() - 0.5) * (420_000_000 + radius * 0.04),
+        (Math.random() - 0.5) * (420_000_000 + radius * 0.04) +
+        galacticYLift,
       galacticCenter.z + Math.sin(angle) * radius,
     );
     dummy.rotation.set(0, 0, 0);
@@ -1864,7 +1875,7 @@ function createGalacticScale() {
   );
   blackHole.position.set(
     galacticCenter.x,
-    galacticCenter.y + denseLayerY,
+    galacticCenter.y + denseLayerY + galacticYLift,
     galacticCenter.z,
   );
   group.add(blackHole);
