@@ -21,7 +21,7 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.1;
+renderer.toneMappingExposure = 1.28;
 const maxAniso = renderer.capabilities.getMaxAnisotropy();
 
 const scene = new THREE.Scene();
@@ -35,12 +35,37 @@ const camera = new THREE.PerspectiveCamera(
   1e24,
 );
 
-const ambient = new THREE.AmbientLight(0x6f84aa, 0.48);
+// Single omnidirectional ambient — identical illumination everywhere (Earth disk uses
+// unlit day texture; picnic / trees use Lambert & Standard with no directional key).
+const ambient = new THREE.AmbientLight(0xf4f7ff, 1.88);
 scene.add(ambient);
 
-const sunLight = new THREE.DirectionalLight(0xffffff, 1.35);
-sunLight.position.set(600, 400, 300);
-scene.add(sunLight);
+// Fullscreen fade in front of the camera while passing through the cloud deck
+// (avoids global fog, which would wash out the cosmos).
+const cloudFadeGeom = new THREE.PlaneGeometry(1, 1);
+const cloudFadeMat = new THREE.MeshBasicMaterial({
+  color: 0xf2f7fc,
+  transparent: true,
+  opacity: 0,
+  depthTest: false,
+  depthWrite: false,
+  toneMapped: false,
+});
+const cloudFadeQuad = new THREE.Mesh(cloudFadeGeom, cloudFadeMat);
+cloudFadeQuad.name = "cloud-penetration-fade";
+cloudFadeQuad.renderOrder = 32767;
+camera.add(cloudFadeQuad);
+scene.add(camera);
+
+function refreshCloudFadeQuadSize() {
+  const dist = 2.15;
+  const vFovRad = THREE.MathUtils.degToRad(camera.fov);
+  const planeH = 2 * Math.tan(vFovRad / 2) * dist;
+  const planeW = planeH * camera.aspect;
+  cloudFadeQuad.scale.set(planeW * 1.15, planeH * 1.15, 1);
+  cloudFadeQuad.position.z = -dist;
+}
+refreshCloudFadeQuadSize();
 
 // ============================================================================
 // Constants + state
@@ -52,8 +77,14 @@ let cloudDisk = null;
 let sunGlowTimeUniform = null;
 /** Earth surface mesh when using realistic shaders — used to refresh globe uniforms. */
 let earthSurfaceMesh = null;
+/** Picnic trees / towers / bushes / houses — visibility tied to zoom in animate(). */
+let picnicSurroundGroup = null;
 
 const _earthCenterScratch = new THREE.Vector3();
+
+// Show surrounding props once the camera has pulled back enough (10^x m).
+const PICNIC_SURROUND_REVEAL_START = -10;
+const PICNIC_SURROUND_REVEAL_END = 1.15;
 
 const metersPerWorldUnit = 1;
 const EARTH_RADIUS = 6700;
@@ -61,18 +92,30 @@ const EARTH_RADIUS = 6700;
 // Orthographic globe mapping: sphere center lies R below the north pole on the disk.
 // Disk plane is y = -0.14 (earth surface mesh position); picnic stays at origin on that disk.
 const EARTH_DISK_Y = -0.14;
+/** Cloud deck group Y (world); must match createCloudLayer wrapper.position.y. */
+const CLOUD_DISK_WORLD_Y = 70;
+/** Descending from space: opacity clears by this height above the deck (m). */
+const CLOUD_FADE_SPAN_ABOVE = 100;
+/**
+ * Below-deck fade uses log10(camera Y): camera moves as 10^exponent, so a linear-Y ramp
+ * only spans a tiny exponent window (instant pop). Fade from ~this height (m) up to the deck.
+ */
+const CLOUD_FADE_NEAR_GROUND_Y = 40;
 const EARTH_SPHERE_CENTER = new THREE.Vector3(
   0,
   EARTH_DISK_Y - EARTH_RADIUS,
   0,
 );
 
-// Rotate globe sampling so the disk center (picnic at world origin) sits over
-// Athens, Georgia, USA — Piedmont forest / green land on the day map, not ocean.
-// (Must match real lat/lon; 30°N / −75°W is open ocean — easy to mistake for “wrong shader”.)
+// Rotate globe sampling so the disk center (picnic + park + city at world origin)
+// sits over this lat/lon on the day map (EPSG-style: +N, +E; west longitudes negative).
+// Tweaking `lat` / `lon` moves the whole picnic scene on Earth. Examples:
+//   Ireland (lush / bright green on many Blue-Marble-style maps): ~53.2°N, 8.0°W
+//   Willamette Valley, OR: ~44.9°N, 123.0°W
+//   Central NZ (South Island): ~43.8°S ⇒ use negative lat in `Math.sin` / `cos` below.
 function createGlobeTextureQuaternion() {
-  const lat = THREE.MathUtils.degToRad(33.85);
-  const lon = THREE.MathUtils.degToRad(-93.36);
+  const lat = THREE.MathUtils.degToRad(53.2);
+  const lon = THREE.MathUtils.degToRad(-8.0);
   const target = new THREE.Vector3(
     Math.cos(lat) * Math.cos(lon),
     Math.sin(lat),
@@ -115,13 +158,13 @@ const DEFAULT_EXPONENT = -1.2;
 const TOUR_RETURN_EXPONENT = 0.3;
 /** Overview landmark (~10^10.65 m). */
 const OVERVIEW_EXPONENT = 10.65;
-const OVERVIEW_TOUR_OUT_SECONDS = 14;
-const OVERVIEW_TOUR_IN_SECONDS = 12;
+const OVERVIEW_TOUR_OUT_SECONDS = 24;
+const OVERVIEW_TOUR_IN_SECONDS = 20;
 
 let exponent = DEFAULT_EXPONENT;
 let speed = 0.18;
 let direction = 1;
-let paused = false;
+let paused = true;
 
 /**
  * @type {{
@@ -222,7 +265,17 @@ void main() {
     fract(lambda * 0.159154943 + 0.5),
     clamp(0.5 + phi * 0.318309886, 0.001, 0.999)
   );
-  gl_FragColor = vec4(texture2D(uDayMap, uv).rgb, 1.0);
+  vec3 c = texture2D(uDayMap, uv).rgb;
+
+  // Display curve on the day texture only: lift dark/baked albedo (ocean, shade)
+  // for a more even read on the disk; UVs and mapping unchanged.
+  float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  float shadow = 1.0 - smoothstep(0.05, 0.4, luma);
+  c *= 1.0 + 0.22 * shadow;
+  c += vec3(0.014, 0.017, 0.022) * shadow * shadow;
+  c = pow(clamp(c, 0.0, 1.0), vec3(0.96));
+
+  gl_FragColor = vec4(c, 1.0);
   #include <logdepthbuf_fragment>
 }
     `,
@@ -328,7 +381,7 @@ function createCloudLayer(
   wrapper.name = "earth-clouds";
   wrapper.rotation.x = -Math.PI / 2;
   // Clear separation from the surface in world Y (reduces z-fighting with log depth).
-  wrapper.position.y = 22;
+  wrapper.position.y = CLOUD_DISK_WORLD_Y;
 
   const disk = new THREE.Mesh(
     new THREE.CircleGeometry(EARTH_RADIUS * 0.998, 192),
@@ -421,6 +474,790 @@ function createLyingPerson(options = {}) {
   return person;
 }
 
+/**
+ * Large urban park (~124 m fenced lawn) around the picnic, then city blocks outside
+ * the fence. Spacing is in meters (1 world unit ≈ 1 m).
+ */
+function createPicnicSurroundings() {
+  const group = new THREE.Group();
+  group.name = "picnic-surround";
+
+  const dummy = new THREE.Object3D();
+  let seed = 582_913;
+  const rnd = () => {
+    seed ^= seed << 13;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    return (seed >>> 0) / 0xffffffff;
+  };
+
+  /** Picnic blanket clearance (m). Blanket mesh is 2.2 × 1.4 (±1.1, ±0.7); pad
+   * past that so scaled tree trunks / crowns do not read on the blanket. */
+  const excludeHalfX = 1.22;
+  const excludeHalfZ = 1.00;
+  /** Half-size of fenced lawn (full width ≈ ~15.5 m vs original ~124 m). */
+  const FENCE_HALF = 7.75;
+  /** Fence posts roughly every this many meters along perimeter. */
+  const FENCE_POST_SPACING = 2.45;
+  // === City grid: axis-aligned blocks around the park ===
+  // Park sits at world origin. Outside the fence: a grass strip, then a
+  // perimeter ring road, then a square grid of grass lots in 4 quadrants.
+  // Major avenues continue along ±x / ±z; narrow streets sit between lots.
+  // Sized so streets read as paths, not freeway -- each lot is much wider
+  // than the road around it so the city blends with the park instead of
+  // floating in asphalt.
+  const STRIP_W = 1.5;
+  const RING_ROAD_W = 1.4;
+  const BLOCK_W = 7.2;
+  const STREET_W = 1.0;
+  const RINGS = 3;
+  const RING_ROAD_INNER = FENCE_HALF + STRIP_W;
+  const RING_ROAD_OUTER = RING_ROAD_INNER + RING_ROAD_W;
+  const BLOCK_PITCH = BLOCK_W + STREET_W;
+  const ASPHALT_Y = 0.006;
+  const LAWN_Y = 0.014;
+  const lotAxisCenter = (n) =>
+    RING_ROAD_OUTER + STREET_W / 2 + n * BLOCK_PITCH + BLOCK_W / 2;
+  // City extent ends flush with the outer block edge -- no trailing
+  // half-street outside the last ring (cuts the asphalt frame down a lot).
+  const CITY_HALF = lotAxisCenter(RINGS - 1) + BLOCK_W / 2;
+
+  /** One descriptor per sidewalk lot: lot center + ring index (0=closest to park). */
+  const cityBlocks = [];
+  for (let qi = 0; qi < RINGS; qi += 1) {
+    for (let qj = 0; qj < RINGS; qj += 1) {
+      for (const sx of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+          cityBlocks.push({
+            cx: sx * lotAxisCenter(qi),
+            cz: sz * lotAxisCenter(qj),
+            ring: Math.max(qi, qj),
+          });
+        }
+      }
+    }
+  }
+
+  function inPicnicExclusion(x, z) {
+    return Math.abs(x) < excludeHalfX && Math.abs(z) < excludeHalfZ;
+  }
+
+  /** Uniform point on the lawn, not on the blanket. */
+  function sampleParkLawn() {
+    const inset = 1.0;
+    const lim = FENCE_HALF - inset;
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const x = (rnd() * 2 - 1) * lim;
+      const z = (rnd() * 2 - 1) * lim;
+      if (inPicnicExclusion(x, z)) continue;
+      return { x, z };
+    }
+    return { x: lim * 0.6, z: lim * 0.35 };
+  }
+
+  /** Post i of n around a square from (-H,-H) to (H,H), CCW from bottom edge. */
+  function fencePostXZ(index, count, H) {
+    const side = 2 * H;
+    let u = (index / count) * (8 * H);
+    if (u < side) {
+      return { x: -H + u, z: -H };
+    }
+    u -= side;
+    if (u < side) {
+      return { x: H, z: -H + u };
+    }
+    u -= side;
+    if (u < side) {
+      return { x: H - u, z: H };
+    }
+    u -= side;
+    return { x: -H, z: H - u };
+  }
+
+  const fencePostCount = Math.max(
+    48,
+    Math.round((8 * FENCE_HALF) / FENCE_POST_SPACING),
+  );
+  const postGeom = new THREE.BoxGeometry(0.15, 1.08, 0.15);
+  postGeom.translate(0, 0.54, 0);
+  const postMat = new THREE.MeshStandardMaterial({
+    color: 0x6d5c48,
+    roughness: 0.62,
+    metalness: 0.06,
+    emissive: 0x2a2218,
+    emissiveIntensity: 0.1,
+  });
+  const fencePosts = new THREE.InstancedMesh(postGeom, postMat, fencePostCount);
+  fencePosts.frustumCulled = false;
+  for (let i = 0; i < fencePostCount; i += 1) {
+    const { x, z } = fencePostXZ(i, fencePostCount, FENCE_HALF);
+    dummy.rotation.set(0, rnd() * 0.06 - 0.03, 0);
+    dummy.scale.setScalar(0.9 + rnd() * 0.14);
+    dummy.position.set(x, 0, z);
+    dummy.updateMatrix();
+    fencePosts.setMatrixAt(i, dummy.matrix);
+  }
+  fencePosts.instanceMatrix.needsUpdate = true;
+  group.add(fencePosts);
+
+  const railGeom = new THREE.BoxGeometry(1, 1, 1);
+  const railMat = new THREE.MeshStandardMaterial({
+    color: 0x8f826e,
+    roughness: 0.5,
+    metalness: 0.07,
+    emissive: 0x3a3228,
+    emissiveIntensity: 0.09,
+  });
+  const railY = 0.84;
+  const railT = 0.078;
+  const railW = 0.17;
+  const sideLen = 2 * FENCE_HALF;
+  const addRail = (sx, sy, sz, px, py, pz) => {
+    const m = new THREE.Mesh(railGeom, railMat);
+    m.scale.set(sx, sy, sz);
+    m.position.set(px, py, pz);
+    group.add(m);
+  };
+  addRail(sideLen + railW, railT, railW, 0, railY, -FENCE_HALF);
+  addRail(sideLen + railW, railT, railW, 0, railY, FENCE_HALF);
+  addRail(railW, railT, sideLen + railW, -FENCE_HALF, railY, 0);
+  addRail(railW, railT, sideLen + railW, FENCE_HALF, railY, 0);
+  addRail(sideLen + railW, railT, railW, 0, railY - 0.34, -FENCE_HALF);
+  addRail(sideLen + railW, railT, railW, 0, railY - 0.34, FENCE_HALF);
+  addRail(railW, railT, sideLen + railW, -FENCE_HALF, railY - 0.34, 0);
+  addRail(railW, railT, sideLen + railW, FENCE_HALF, railY - 0.34, 0);
+
+  // === Roads ===
+  // Warm gravel rather than highway-black so the streets read as a small
+  // village, not a downtown grid. Drawn as explicit strips (ring road +
+  // streets between blocks + 4 axis avenues) so the visible asphalt is just
+  // the road network -- everything else is lawn.
+  const roadGeom = new THREE.BoxGeometry(1, 0.005, 1);
+  const roadMat = new THREE.MeshLambertMaterial({
+    color: 0x4f463a,
+    emissive: 0x231d14,
+    emissiveIntensity: 0.28,
+  });
+  const addRoadStrip = (x0, z0, x1, z1) => {
+    const w = x1 - x0;
+    const d = z1 - z0;
+    if (w <= 0 || d <= 0) return;
+    const m = new THREE.Mesh(roadGeom, roadMat);
+    m.scale.set(w, 1, d);
+    m.position.set((x0 + x1) / 2, ASPHALT_Y, (z0 + z1) / 2);
+    group.add(m);
+  };
+
+  // Ring road around the park (4 strips forming a square donut).
+  addRoadStrip(-RING_ROAD_OUTER, RING_ROAD_INNER, RING_ROAD_OUTER, RING_ROAD_OUTER);
+  addRoadStrip(-RING_ROAD_OUTER, -RING_ROAD_OUTER, RING_ROAD_OUTER, -RING_ROAD_INNER);
+  addRoadStrip(-RING_ROAD_OUTER, -RING_ROAD_INNER, -RING_ROAD_INNER, RING_ROAD_INNER);
+  addRoadStrip(RING_ROAD_INNER, -RING_ROAD_INNER, RING_ROAD_OUTER, RING_ROAD_INNER);
+
+  // Streets between block columns (and the half-street next to the ring road).
+  // Each entry is one street center on the +axis side; reflected to -axis.
+  const streetSegs = [
+    { c: RING_ROAD_OUTER + STREET_W / 4, halfW: STREET_W / 4 },
+  ];
+  for (let n = 0; n < RINGS - 1; n += 1) {
+    streetSegs.push({
+      c: lotAxisCenter(n) + BLOCK_W / 2 + STREET_W / 2,
+      halfW: STREET_W / 2,
+    });
+  }
+
+  for (const sign of [-1, 1]) {
+    for (const seg of streetSegs) {
+      const sCenter = sign * seg.c;
+      // Vertical street (constant x, runs both +z and -z halves).
+      addRoadStrip(
+        sCenter - seg.halfW,
+        RING_ROAD_INNER,
+        sCenter + seg.halfW,
+        CITY_HALF,
+      );
+      addRoadStrip(
+        sCenter - seg.halfW,
+        -CITY_HALF,
+        sCenter + seg.halfW,
+        -RING_ROAD_INNER,
+      );
+      // Horizontal street (constant z).
+      addRoadStrip(
+        RING_ROAD_INNER,
+        sCenter - seg.halfW,
+        CITY_HALF,
+        sCenter + seg.halfW,
+      );
+      addRoadStrip(
+        -CITY_HALF,
+        sCenter - seg.halfW,
+        -RING_ROAD_INNER,
+        sCenter + seg.halfW,
+      );
+    }
+  }
+  // Major avenues continuing along the ±x and ±z axes between quadrants.
+  addRoadStrip(-CITY_HALF, -STREET_W / 2, -RING_ROAD_OUTER, STREET_W / 2);
+  addRoadStrip(RING_ROAD_OUTER, -STREET_W / 2, CITY_HALF, STREET_W / 2);
+  addRoadStrip(-STREET_W / 2, -CITY_HALF, STREET_W / 2, -RING_ROAD_OUTER);
+  addRoadStrip(-STREET_W / 2, RING_ROAD_OUTER, STREET_W / 2, CITY_HALF);
+
+  // === Lawn lots (one grass square per lot — buildings/houses sit on these) ===
+  const lawnGeom = new THREE.BoxGeometry(BLOCK_W, 0.006, BLOCK_W);
+  const lawnMat = new THREE.MeshLambertMaterial({
+    color: 0x6cae5c,
+    emissive: 0x244c1c,
+    emissiveIntensity: 0.32,
+  });
+  const lawns = new THREE.InstancedMesh(
+    lawnGeom,
+    lawnMat,
+    cityBlocks.length,
+  );
+  lawns.frustumCulled = false;
+  for (let i = 0; i < cityBlocks.length; i += 1) {
+    const { cx, cz } = cityBlocks[i];
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.setScalar(1);
+    dummy.position.set(cx, LAWN_Y, cz);
+    dummy.updateMatrix();
+    lawns.setMatrixAt(i, dummy.matrix);
+  }
+  lawns.instanceMatrix.needsUpdate = true;
+  group.add(lawns);
+
+  // Street trees at the four corners of every sidewalk lot.
+  const streetTrees = [];
+  for (const block of cityBlocks) {
+    const cornerInset = 0.45;
+    const ex = BLOCK_W / 2 - cornerInset;
+    streetTrees.push(
+      { x: block.cx - ex, z: block.cz - ex },
+      { x: block.cx + ex, z: block.cz - ex },
+      { x: block.cx - ex, z: block.cz + ex },
+      { x: block.cx + ex, z: block.cz + ex },
+    );
+  }
+
+  // Trees outside the built-up square — sparse scatter in a wide belt (same
+  // count as before: target is derived from a fixed reference extent, not the
+  // wider sample box, so widening does not add instances).
+  const outerTreeRefHalf = CITY_HALF + 18;
+  const outerTreeTarget = Math.max(
+    72,
+    Math.round((8 * outerTreeRefHalf) / 2.8),
+  );
+  const OUTER_TREE_INNER = CITY_HALF + 1.2;
+  const OUTER_TREE_OUTER = CITY_HALF + 46;
+  const outerCityTrees = [];
+  for (
+    let attempt = 0;
+    outerCityTrees.length < outerTreeTarget && attempt < 40_000;
+    attempt += 1
+  ) {
+    const x = (rnd() * 2 - 1) * OUTER_TREE_OUTER;
+    const z = (rnd() * 2 - 1) * OUTER_TREE_OUTER;
+    const cheb = Math.max(Math.abs(x), Math.abs(z));
+    if (cheb < OUTER_TREE_INNER) continue;
+    const jx = (rnd() - 0.5) * 1.75;
+    const jz = (rnd() - 0.5) * 1.75;
+    const nx = x + jx;
+    const nz = z + jz;
+    if (Math.max(Math.abs(nx), Math.abs(nz)) < OUTER_TREE_INNER) continue;
+    if (Math.max(Math.abs(nx), Math.abs(nz)) > OUTER_TREE_OUTER + 1.4) continue;
+    outerCityTrees.push({ x: nx, z: nz });
+  }
+
+  const cityTreePositions = streetTrees.concat(outerCityTrees);
+  const trunkH = 0.86;
+  const crownH = 1.22;
+  const treeCountPark = 20;
+  const treeCountCity = cityTreePositions.length;
+  const treeCount = treeCountPark + treeCountCity;
+  const trunkGeom = new THREE.CylinderGeometry(0.1, 0.125, trunkH, 7);
+  const crownGeom = new THREE.ConeGeometry(0.55, crownH, 8);
+  const trunkMat = new THREE.MeshLambertMaterial({
+    color: 0x7a5a42,
+    emissive: 0x3a2820,
+    emissiveIntensity: 0.22,
+  });
+  const treeCrownMat = new THREE.MeshLambertMaterial({
+    color: 0x4da668,
+    emissive: 0x1e5030,
+    emissiveIntensity: 0.28,
+  });
+  const treeTrunks = new THREE.InstancedMesh(trunkGeom, trunkMat, treeCount);
+  const treeCrowns = new THREE.InstancedMesh(
+    crownGeom,
+    treeCrownMat,
+    treeCount,
+  );
+  treeTrunks.frustumCulled = false;
+  treeCrowns.frustumCulled = false;
+
+  for (let i = 0; i < treeCount; i += 1) {
+    const cityIdx = i - treeCountPark;
+    const isCity = cityIdx >= 0;
+    const pos = isCity ? cityTreePositions[cityIdx] : sampleParkLawn();
+    const { x, z } = pos;
+    const isStreetLotTree = isCity && cityIdx < streetTrees.length;
+    const s = isCity
+      ? isStreetLotTree
+        ? 0.7 + rnd() * 0.3
+        : 1.02 + rnd() * 0.72
+      : 1.05 + rnd() * 1.12;
+    const baseY = isCity ? (isStreetLotTree ? LAWN_Y : 0) : 0;
+    const ry = rnd() * Math.PI * 2;
+    dummy.rotation.set(0, ry, 0);
+    dummy.scale.setScalar(s);
+    dummy.position.set(x, baseY + trunkH * 0.5 * s, z);
+    dummy.updateMatrix();
+    treeTrunks.setMatrixAt(i, dummy.matrix);
+    dummy.position.set(x, baseY + (trunkH + crownH * 0.5) * s, z);
+    dummy.updateMatrix();
+    treeCrowns.setMatrixAt(i, dummy.matrix);
+  }
+  treeTrunks.instanceMatrix.needsUpdate = true;
+  treeCrowns.instanceMatrix.needsUpdate = true;
+  group.add(treeTrunks, treeCrowns);
+
+  // === Commercial buildings on inner rings (closest to the park) ===
+  // Each lot picks a random site plan (one big building, two side-by-side, or
+  // 3-4 small ones on a 2x2 sub-grid). Per-building rotation, footprint, and
+  // position jitter keep adjacent blocks from looking stamped.
+  const COMMERCIAL_PALETTE = [
+    0xff8a72, 0xffd166, 0x7ec4cf, 0xa3e4a8, 0xb8a4dc, 0xffb482, 0xffd1dc,
+    0x90c8e8, 0xff9bb3, 0xb6e388, 0xf6c453, 0xfcb1a6, 0xa9e0d4,
+  ];
+  const pickCommercialColor = () =>
+    COMMERCIAL_PALETTE[Math.floor(rnd() * COMMERCIAL_PALETTE.length)];
+  const lotInset = 0.85;
+  const lotSide = BLOCK_W - 2 * lotInset;
+  const subSide = lotSide / 2;
+  const subOff = subSide / 2;
+  const buildingCells = [];
+  for (const block of cityBlocks) {
+    if (block.ring > 1) continue;
+    const plan = rnd();
+    if (plan < 0.22) {
+      buildingCells.push({
+        x: block.cx + (rnd() - 0.5) * 0.5,
+        z: block.cz + (rnd() - 0.5) * 0.5,
+        w: lotSide * (0.55 + rnd() * 0.18),
+        d: lotSide * (0.55 + rnd() * 0.18),
+        ry: (rnd() - 0.5) * 0.36,
+        ring: block.ring,
+        colorHex: pickCommercialColor(),
+      });
+    } else if (plan < 0.5) {
+      const alongX = rnd() < 0.5;
+      for (const s of [-1, 1]) {
+        buildingCells.push({
+          x: block.cx + (alongX ? s * subOff : (rnd() - 0.5) * 0.6),
+          z: block.cz + (alongX ? (rnd() - 0.5) * 0.6 : s * subOff),
+          w: (alongX ? subSide : lotSide * 0.5) * (0.7 + rnd() * 0.2),
+          d: (alongX ? lotSide * 0.5 : subSide) * (0.7 + rnd() * 0.2),
+          ry: (rnd() - 0.5) * 0.32,
+          ring: block.ring,
+          colorHex: pickCommercialColor(),
+        });
+      }
+    } else {
+      const dropRate = plan < 0.78 ? 0.28 : 0.05;
+      for (const si of [-1, 1]) {
+        for (const sj of [-1, 1]) {
+          if (rnd() < dropRate) continue;
+          buildingCells.push({
+            x: block.cx + si * subOff + (rnd() - 0.5) * 0.4,
+            z: block.cz + sj * subOff + (rnd() - 0.5) * 0.4,
+            w: subSide * (0.62 + rnd() * 0.32),
+            d: subSide * (0.62 + rnd() * 0.32),
+            ry: (rnd() - 0.5) * 0.36,
+            ring: block.ring,
+            colorHex: pickCommercialColor(),
+          });
+        }
+      }
+    }
+  }
+
+  const buildingCount = buildingCells.length;
+  const buildingGeom = new THREE.BoxGeometry(1, 1, 1);
+  const buildingMat = new THREE.MeshLambertMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    emissive: 0x4a4a52,
+    emissiveIntensity: 0.45,
+  });
+  const towerCrownMat = new THREE.MeshLambertMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    emissive: 0x787880,
+    emissiveIntensity: 0.55,
+  });
+  const buildings = new THREE.InstancedMesh(
+    buildingGeom,
+    buildingMat,
+    buildingCount,
+  );
+  const buildingCrowns = new THREE.InstancedMesh(
+    buildingGeom,
+    towerCrownMat,
+    buildingCount,
+  );
+  buildings.frustumCulled = false;
+  buildingCrowns.frustumCulled = false;
+  const bColor = new THREE.Color();
+  const crownTint = new THREE.Color();
+  const tmpWhite = new THREE.Color(1, 1, 1);
+
+  for (let i = 0; i < buildingCount; i += 1) {
+    const cell = buildingCells[i];
+    const bx = cell.w;
+    const bz = cell.d;
+    const bh = cell.ring === 0 ? 1.8 + rnd() * 2.4 : 1.2 + rnd() * 1.4;
+
+    dummy.rotation.set(0, cell.ry, 0);
+    dummy.scale.set(bx, bh, bz);
+    dummy.position.set(cell.x, LAWN_Y + bh / 2, cell.z);
+    dummy.updateMatrix();
+    buildings.setMatrixAt(i, dummy.matrix);
+
+    bColor.setHex(cell.colorHex);
+    buildings.setColorAt(i, bColor);
+
+    const topCrownH = Math.min(0.34, 0.085 + rnd() * 0.14 + bh * 0.04);
+    const crownScale = 0.86 + rnd() * 0.08;
+    dummy.rotation.set(0, cell.ry, 0);
+    dummy.scale.set(bx * crownScale, topCrownH, bz * crownScale);
+    dummy.position.set(cell.x, LAWN_Y + bh - topCrownH * 0.5, cell.z);
+    dummy.updateMatrix();
+    buildingCrowns.setMatrixAt(i, dummy.matrix);
+
+    crownTint.copy(bColor).lerp(tmpWhite, 0.5).multiplyScalar(1.12);
+    crownTint.r = Math.min(1, crownTint.r);
+    crownTint.g = Math.min(1, crownTint.g);
+    crownTint.b = Math.min(1, crownTint.b);
+    buildingCrowns.setColorAt(i, crownTint);
+  }
+  buildings.instanceMatrix.needsUpdate = true;
+  buildingCrowns.instanceMatrix.needsUpdate = true;
+  if (buildings.instanceColor) {
+    buildings.instanceColor.needsUpdate = true;
+  }
+  if (buildingCrowns.instanceColor) {
+    buildingCrowns.instanceColor.needsUpdate = true;
+  }
+  group.add(buildings, buildingCrowns);
+
+  const bushCount = 6;
+  const bushGeom = new THREE.IcosahedronGeometry(0.24, 0);
+  const bushMat = new THREE.MeshLambertMaterial({
+    color: 0x228b22,
+  });
+  const bushes = new THREE.InstancedMesh(bushGeom, bushMat, bushCount);
+  bushes.frustumCulled = false;
+  const bushColor = new THREE.Color();
+
+  for (let i = 0; i < bushCount; i += 1) {
+    const { x, z } = sampleParkLawn();
+    const sx = 0.95 + rnd() * 1.15;
+    const sy = 0.55 + rnd() * 0.5;
+    const sz = 0.95 + rnd() * 1.15;
+    const ry = rnd() * Math.PI * 2;
+    dummy.rotation.set(0, ry, rnd() * 0.18 - 0.09);
+    dummy.scale.set(sx, sy, sz);
+    dummy.position.set(x, 0.24 * sy, z);
+    dummy.updateMatrix();
+    bushes.setMatrixAt(i, dummy.matrix);
+
+    // const g = 0.22 + rnd() * 0.18;
+    // bushColor.setRGB(0.12 + g * 0.35, 0.42 + g * 0.35, 0.14 + g * 0.12);
+    // bushes.setColorAt(i, bushColor);
+  }
+  bushes.instanceMatrix.needsUpdate = true;
+  if (bushes.instanceColor) {
+    bushes.instanceColor.needsUpdate = true;
+  }
+  group.add(bushes);
+
+  const benchCount = 0;
+  const benchSeatMat = new THREE.MeshStandardMaterial({
+    color: 0x9c8b6e,
+    roughness: 0.55,
+    metalness: 0.04,
+    emissive: 0x4a4034,
+    emissiveIntensity: 0.11,
+  });
+  const benchBackMat = new THREE.MeshStandardMaterial({
+    color: 0x8a7a60,
+    roughness: 0.56,
+    metalness: 0.04,
+    emissive: 0x3e362c,
+    emissiveIntensity: 0.1,
+  });
+  const benchGeom = new THREE.BoxGeometry(1, 1, 1);
+  const benchSeats = new THREE.InstancedMesh(
+    benchGeom,
+    benchSeatMat,
+    benchCount,
+  );
+  const benchBacks = new THREE.InstancedMesh(
+    benchGeom,
+    benchBackMat,
+    benchCount,
+  );
+  benchSeats.frustumCulled = false;
+  benchBacks.frustumCulled = false;
+  const benchInset = 0.875;
+  const spanHalf = FENCE_HALF - benchInset - 1.375;
+  const cols = 8;
+  const xAlong = (k) => -spanHalf + (k / (cols - 1)) * (2 * spanHalf);
+  let benchIdx = 0;
+  const placeBenchRow = (xFn, zFn, ry) => {
+    for (let k = 0; k < cols; k += 1) {
+      const bx = xFn(k);
+      const bz = zFn(k);
+      const seatY = 0.46;
+      const forwardX = Math.sin(ry);
+      const forwardZ = Math.cos(ry);
+      dummy.rotation.set(0, ry, 0);
+      dummy.scale.set(1.88, 0.065, 0.54);
+      dummy.position.set(bx, seatY, bz);
+      dummy.updateMatrix();
+      benchSeats.setMatrixAt(benchIdx, dummy.matrix);
+      const backY = seatY + 0.21;
+      const bd = 0.27;
+      dummy.scale.set(1.88, 0.42, 0.065);
+      dummy.position.set(bx - forwardX * bd, backY, bz - forwardZ * bd);
+      dummy.updateMatrix();
+      benchBacks.setMatrixAt(benchIdx, dummy.matrix);
+      benchIdx += 1;
+    }
+  };
+  placeBenchRow(
+    (k) => xAlong(k),
+    () => -FENCE_HALF + benchInset,
+    Math.PI,
+  );
+  placeBenchRow(
+    (k) => xAlong(k),
+    () => FENCE_HALF - benchInset,
+    0,
+  );
+  placeBenchRow(
+    () => -FENCE_HALF + benchInset,
+    (k) => xAlong(k),
+    -Math.PI / 2,
+  );
+  placeBenchRow(
+    () => FENCE_HALF - benchInset,
+    (k) => xAlong(k),
+    Math.PI / 2,
+  );
+  benchSeats.instanceMatrix.needsUpdate = true;
+  benchBacks.instanceMatrix.needsUpdate = true;
+  group.add(benchSeats, benchBacks);
+
+  // === Small houses on the outer ring (peaked roofs, bright pastel walls) ===
+  // Brighter pastels + warmer roof palette so they read as cottages from above.
+  const HOUSE_PALETTE = [
+    0xfff3c4, 0xffe18a, 0xffb3a3, 0xc6e6ff, 0xe5cdf5, 0xc6e8a8, 0xffeab0,
+    0xffd9bf, 0xffd1dc, 0xd6ecff, 0xfff0a8, 0xdaf0c8, 0xffc8a8, 0xc4f0d4,
+  ];
+  const ROOF_PALETTE = [
+    0xd87056, 0x7a96ad, 0x68987c, 0xc25040, 0xa67060, 0x8a7a98, 0x5d758f,
+    0xb86a52, 0xa45848, 0x6e8a72,
+  ];
+  const houseCells = [];
+  for (const block of cityBlocks) {
+    if (block.ring < 2) continue;
+    const plan = rnd();
+    if (plan < 0.18) {
+      // Single bigger house centered on the lot.
+      houseCells.push({
+        x: block.cx + (rnd() - 0.5) * 0.5,
+        z: block.cz + (rnd() - 0.5) * 0.5,
+        w: lotSide * (0.5 + rnd() * 0.16),
+        d: lotSide * (0.5 + rnd() * 0.16),
+        ry: (rnd() - 0.5) * 0.4,
+        wallHex: HOUSE_PALETTE[Math.floor(rnd() * HOUSE_PALETTE.length)],
+        roofHex: ROOF_PALETTE[Math.floor(rnd() * ROOF_PALETTE.length)],
+      });
+    } else if (plan < 0.42) {
+      // Two side-by-side houses.
+      const alongX = rnd() < 0.5;
+      for (const s of [-1, 1]) {
+        houseCells.push({
+          x: block.cx + (alongX ? s * subOff : (rnd() - 0.5) * 0.5),
+          z: block.cz + (alongX ? (rnd() - 0.5) * 0.5 : s * subOff),
+          w: subSide * (0.74 + rnd() * 0.18),
+          d: subSide * (0.74 + rnd() * 0.18),
+          ry: (rnd() - 0.5) * 0.4,
+          wallHex: HOUSE_PALETTE[Math.floor(rnd() * HOUSE_PALETTE.length)],
+          roofHex: ROOF_PALETTE[Math.floor(rnd() * ROOF_PALETTE.length)],
+        });
+      }
+    } else {
+      // Three or four small cottages.
+      const dropRate = plan < 0.72 ? 0.32 : 0.08;
+      for (const si of [-1, 1]) {
+        for (const sj of [-1, 1]) {
+          if (rnd() < dropRate) continue;
+          houseCells.push({
+            x: block.cx + si * subOff + (rnd() - 0.5) * 0.45,
+            z: block.cz + sj * subOff + (rnd() - 0.5) * 0.45,
+            w: subSide * (0.62 + rnd() * 0.3),
+            d: subSide * (0.62 + rnd() * 0.3),
+            ry: (rnd() - 0.5) * 0.45,
+            wallHex: HOUSE_PALETTE[Math.floor(rnd() * HOUSE_PALETTE.length)],
+            roofHex: ROOF_PALETTE[Math.floor(rnd() * ROOF_PALETTE.length)],
+          });
+        }
+      }
+    }
+  }
+
+  const houseCount = houseCells.length;
+  const houseBoxGeom = new THREE.BoxGeometry(1, 1, 1);
+  // Square pyramid (4-sided cone with side faces aligned to x/z axes after
+  // a 45° yaw): unit-cube base when scaled by (w, h, d).
+  const houseRoofGeom = new THREE.ConeGeometry(Math.SQRT1_2, 1, 4);
+  houseRoofGeom.rotateY(Math.PI / 4);
+  const houseBodyMat = new THREE.MeshLambertMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    emissive: 0x6a584a,
+    emissiveIntensity: 0.4,
+  });
+  const houseRoofMat = new THREE.MeshLambertMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    emissive: 0x4a3428,
+    emissiveIntensity: 0.42,
+  });
+  const houseTrimMat = new THREE.MeshLambertMaterial({
+    color: 0xfff5e0,
+    emissive: 0xc8b894,
+    emissiveIntensity: 0.5,
+  });
+  const houseBodies = new THREE.InstancedMesh(
+    houseBoxGeom,
+    houseBodyMat,
+    houseCount,
+  );
+  const houseRoofs = new THREE.InstancedMesh(
+    houseRoofGeom,
+    houseRoofMat,
+    houseCount,
+  );
+  const houseTrims = new THREE.InstancedMesh(
+    houseBoxGeom,
+    houseTrimMat,
+    houseCount,
+  );
+  houseBodies.frustumCulled = false;
+  houseRoofs.frustumCulled = false;
+  houseTrims.frustumCulled = false;
+  const wallCol = new THREE.Color();
+  const roofCol = new THREE.Color();
+
+  for (let i = 0; i < houseCount; i += 1) {
+    const cell = houseCells[i];
+    const w = cell.w;
+    const d = cell.d;
+    const bodyH = 0.7 + rnd() * 0.6;
+    const roofH = 0.4 + rnd() * 0.4;
+    const trimH = 0.05;
+
+    dummy.rotation.set(0, cell.ry, 0);
+    dummy.scale.set(w, bodyH, d);
+    dummy.position.set(cell.x, LAWN_Y + bodyH / 2, cell.z);
+    dummy.updateMatrix();
+    houseBodies.setMatrixAt(i, dummy.matrix);
+
+    dummy.scale.set(w * 1.04, trimH, d * 1.04);
+    dummy.position.set(cell.x, LAWN_Y + bodyH + trimH / 2, cell.z);
+    dummy.updateMatrix();
+    houseTrims.setMatrixAt(i, dummy.matrix);
+
+    dummy.scale.set(w * 1.06, roofH, d * 1.06);
+    dummy.position.set(cell.x, LAWN_Y + bodyH + trimH + roofH / 2, cell.z);
+    dummy.updateMatrix();
+    houseRoofs.setMatrixAt(i, dummy.matrix);
+
+    wallCol.setHex(cell.wallHex);
+    houseBodies.setColorAt(i, wallCol);
+    roofCol.setHex(cell.roofHex);
+    houseRoofs.setColorAt(i, roofCol);
+  }
+  houseBodies.instanceMatrix.needsUpdate = true;
+  houseRoofs.instanceMatrix.needsUpdate = true;
+  houseTrims.instanceMatrix.needsUpdate = true;
+  if (houseBodies.instanceColor) {
+    houseBodies.instanceColor.needsUpdate = true;
+  }
+  if (houseRoofs.instanceColor) {
+    houseRoofs.instanceColor.needsUpdate = true;
+  }
+  group.add(houseBodies, houseTrims, houseRoofs);
+
+  // === Yard greenery on commercial+residential lots (homier feel) ===
+  // Random bush sprinkles inside each lot. Some overlap with buildings is
+  // intentional -- reads as foundation plantings / front-yard shrubs.
+  const yardBushPositions = [];
+  for (const block of cityBlocks) {
+    if (block.ring < 1) continue; // skip the small "downtown" core
+    const cnt = block.ring === 2
+      ? 3 + Math.floor(rnd() * 3)
+      : 1 + Math.floor(rnd() * 2);
+    for (let n = 0; n < cnt; n += 1) {
+      const ox = (rnd() - 0.5) * (BLOCK_W - 0.6);
+      const oz = (rnd() - 0.5) * (BLOCK_W - 0.6);
+      yardBushPositions.push({ x: block.cx + ox, z: block.cz + oz });
+    }
+  }
+  const yardBushCount = yardBushPositions.length;
+  if (yardBushCount > 0) {
+    const yardBushGeom = new THREE.IcosahedronGeometry(0.18, 0);
+    const yardBushMat = new THREE.MeshLambertMaterial({
+      color: 0xffffff,
+      vertexColors: true,
+      emissive: 0x224a1a,
+      emissiveIntensity: 0.34,
+    });
+    const yardBushes = new THREE.InstancedMesh(
+      yardBushGeom,
+      yardBushMat,
+      yardBushCount,
+    );
+    yardBushes.frustumCulled = false;
+    const ybColor = new THREE.Color();
+    for (let i = 0; i < yardBushCount; i += 1) {
+      const p = yardBushPositions[i];
+      const sx = 0.7 + rnd() * 0.6;
+      const sy = 0.5 + rnd() * 0.4;
+      const sz = 0.7 + rnd() * 0.6;
+      dummy.rotation.set(0, rnd() * Math.PI * 2, rnd() * 0.18 - 0.09);
+      dummy.scale.set(sx, sy, sz);
+      dummy.position.set(p.x, LAWN_Y + 0.18 * sy, p.z);
+      dummy.updateMatrix();
+      yardBushes.setMatrixAt(i, dummy.matrix);
+      const t = 0.18 + rnd() * 0.32;
+      ybColor.setRGB(0.18 + t * 0.4, 0.42 + t * 0.45, 0.18 + t * 0.32);
+      yardBushes.setColorAt(i, ybColor);
+    }
+    yardBushes.instanceMatrix.needsUpdate = true;
+    if (yardBushes.instanceColor) {
+      yardBushes.instanceColor.needsUpdate = true;
+    }
+    group.add(yardBushes);
+  }
+
+  return group;
+}
+
 function createPicnicScale() {
   const group = new THREE.Group();
 
@@ -485,6 +1322,10 @@ function createPicnicScale() {
   basketGroup.add(basketHandle);
 
   group.add(basketGroup);
+
+  const surround = createPicnicSurroundings();
+  picnicSurroundGroup = surround;
+  group.add(surround);
 
   return group;
 }
@@ -1098,7 +1939,7 @@ function setupScene(earthMaps) {
 function updateCamera() {
   const distanceMeters = 10 ** exponent;
   const distanceWorld = distanceMeters / metersPerWorldUnit;
-  camera.position.set(0, distanceWorld, 0);
+  camera.position.set(0, distanceWorld + 0.5, 0);
   camera.lookAt(0, 0, 0);
 
   // Keep everything in frustum: farthest point is at most ~distanceWorld + SCENE_RADIUS
@@ -1130,6 +1971,21 @@ function updateCamera() {
       statusLabel.textContent = `${speed.toFixed(2)}x | ${dirText}`;
     }
   }
+}
+
+function updateCloudPenetrationFade() {
+  const deckExp = Math.log10(CLOUD_DISK_WORLD_Y);
+
+  const belowExp = Math.log10(CLOUD_FADE_NEAR_GROUND_Y);
+  const aboveExp = Math.log10(CLOUD_DISK_WORLD_Y + CLOUD_FADE_SPAN_ABOVE);
+
+  const fadeIn = THREE.MathUtils.smoothstep(exponent, belowExp, deckExp);
+
+  const fadeOut = 1 - THREE.MathUtils.smoothstep(exponent, deckExp, aboveExp);
+
+  const k = THREE.MathUtils.clamp(fadeIn * fadeOut, 0, 1);
+
+  cloudFadeMat.opacity = THREE.MathUtils.smootherstep(k, 0, 1) * 0.9;
 }
 
 // ============================================================================
@@ -1189,7 +2045,19 @@ function animate() {
     sunGlowTimeUniform.value = clock.getElapsedTime();
   }
 
+if (picnicSurroundGroup) {
+  const t = THREE.MathUtils.smoothstep(
+    exponent,
+    PICNIC_SURROUND_REVEAL_START,
+    PICNIC_SURROUND_REVEAL_END,
+  );
+
+  picnicSurroundGroup.visible = t > 0.01;
+  picnicSurroundGroup.scale.setScalar(THREE.MathUtils.lerp(0.001, 1.0, t));
+}
+
   updateCamera();
+  updateCloudPenetrationFade();
 
   renderer.render(scene, camera);
 }
@@ -1253,6 +2121,7 @@ window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  refreshCloudFadeQuadSize();
 });
 
 document.addEventListener("visibilitychange", () => {
