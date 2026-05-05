@@ -41,6 +41,13 @@ h1 {
   font-size: 0.95rem;
 }
 
+#status {
+  margin: 0 0 4px 0;
+  font-size: 0.82rem;
+  opacity: 0.92;
+  letter-spacing: 0.02em;
+}
+
 #hint {
   margin: 0;
   font-size: 0.78rem;
